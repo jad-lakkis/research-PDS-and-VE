@@ -1,0 +1,159 @@
+% ============================================================
+% One-page progress summary — compiles as-is on Overleaf.
+%
+% Upload the following image to the Overleaf project:
+%   pic2.png — per-tile QP representations
+%
+% Figures use [H], so they remain exactly where inserted.
+% If the document exceeds one page, change 10pt to 9pt.
+% ============================================================
+
+\documentclass[10pt,conference]{IEEEtran}
+
+\usepackage{graphicx}
+\usepackage{float}      % Provides the [H] placement option
+\usepackage{enumitem}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{amssymb}
+
+
+\setlist{
+    noitemsep,
+    topsep=2pt,
+    partopsep=0pt,
+    leftmargin=*
+}
+
+\begin{document}
+
+\title{Summary and Questions}
+
+\author{\IEEEauthorblockN{Jad Al Lakkis}}
+
+
+\maketitle
+\thispagestyle{empty}
+
+\begin{abstract}This is a quick summary of the progress in data exploration since last meeting and some questions about modeling choices I encountered.
+\end{abstract}
+
+\section{Summary}
+
+\begin{itemize}
+    \item Extracted the dataset
+    (\texttt{hn.mat}, \texttt{rd.mat}, 15 videos) , analzed it , and encountered some missing things that I have to choose and add before implementing the actual code.
+
+\end{itemize}
+
+
+\section{Key Open Questions and Modeling Decisions}
+
+\noindent
+\textbf{Channel-gain parameters.}
+\noindent
+ This dataset doesnt provide anything about channel gain. But the related 2025 paper provides the following closed-form Rician-fading and path-loss channel model:
+
+\[
+h^t=
+\frac{3.24\times10^{-4}|\psi^t|^2}
+{\left[d^t\tan^{-1}\left(\frac{24\sqrt{2}}{5}\right)\right]^2},
+\qquad
+K=12~\mathrm{dB},
+\qquad
+\mathbb{E}[|\psi^t|^2]=1.
+\]
+\textbf{Should this model be reused as-is?}
+
+\medskip
+
+\noindent
+\textbf{Base/enhancement-layer implementation.}
+The dataset has no scalable-video-coding layers (no BL-EL split) , only independent QP
+representations.
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.90\linewidth]{pic2.png}
+    \caption{Per-tile QP representations available in the dataset (shown only 8 of them in the screenshot)}
+    \label{fig:qp_representations}
+\end{figure}
+
+The proposed approach sends a base-quality representation
+for every tile and models an enhanced tile by replacing its base-quality
+representation with a higher-quality version, rather than transmitting two
+complete streams. So the data-volume
+
+\[
+A^t
+=
+A_{\text{base}}^t
++
+\sum_i x_i^t\Delta A_i^t,
+\qquad
+\Delta A_i^t
+=
+A_{i,\text{selected}}^t-A_{i,\text{base}}^t.
+\]
+
+\noindent
+\textbf{Does this match the intended formulation, or is genuine scalable
+and additive enhancement data required? Which QP indices should represent
+the base and enhanced qualities?}
+
+\begin{table}[H]
+    \centering
+    \footnotesize
+    \begin{tabular}{@{}p{2.1cm}p{5.3cm}@{}}
+        \toprule
+        \textbf{Decision} & \textbf{Options} \\
+        \midrule
+
+        FOV source &
+        To define the actual Viewport, I need the yaw, pitch and FOV.. do i define the Fov the same as the 2025 paper?\\
+
+        UAV mobility &
+        Do i use the same static-distance $d=50\,\mathrm{m}$ case
+        reported in the 2025 paper? \\
+
+        Training &
+        Do I train on all 15 videos, or choose one of them at first and train on that? Do I train and evaluate a separate policy per video?\\
+
+        Partial-tile visibility &
+        Any-overlap vs.\ overlap threshold vs.\ area-weighted coverage \\
+
+        Parameters &
+        Do I use the same as the paper: $P_{\max}$, $W$, $T_0$, $N_0$ as $20\,\mathrm{dBm}$, $10\,\mathrm{MHz}$, $1\,\mathrm{s}$, $-174\,\mathrm{dBm/Hz}$\\
+
+        Critic count &
+        One critic to start, or two (as in prior related work)?\\
+
+        \bottomrule
+    \end{tabular}
+    \caption{Additional modeling decisions requiring confirmation.}
+    \label{tab:decisions}
+\end{table}
+\noindent
+\textbf{Constraint budgets.}
+How should I define the constraint thresholds $\bar{D}$, $\bar{P}$, and $\bar{B}$ in the constrained MDP?
+
+\[
+\begin{aligned}
+\bar{D} &: \text{ stall duration budget},\\
+\bar{P} &: \text{power budget},\\
+\bar{B} &: \text{number of enhanced tiles budget}.
+\end{aligned}
+\]
+
+\noindent
+Should these values be adopted from prior work,or selected experimentally or otherwise?
+\section{Next Steps}
+
+\begin{enumerate}
+    \item Resolve the modeling questions listed above.
+    \item Implement the Gymnasium environment using the formulated state,
+    action, transition, constraint, and reward definitions.
+    \item Train and validate a PPO baseline before introducing
+    post-decision states and virtual experience.
+\end{enumerate}
+
+\end{document}

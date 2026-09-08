@@ -1,0 +1,9 @@
+# torch installed separately - its CUDA build depends on the target machine
+# (CPU-only locally, CUDA build matching the RunPod image's CUDA version on
+# RunPod), e.g.: pip install torch --index-url https://download.pytorch.org/whl/cu121
+stable_baselines3==2.9.0
+gymnasium==1.3.0
+numpy
+pandas
+matplotlib
+scipy

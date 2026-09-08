@@ -1,0 +1,133 @@
+% ============================================================
+% One-page progress summary -- compiles as-is on Overleaf.
+% If the document exceeds one page, change 10pt to 9pt.
+% ============================================================
+
+\documentclass[10pt,conference]{IEEEtran}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{float}
+\usepackage{enumitem}
+
+\setlist{
+    noitemsep,
+    topsep=2pt,
+    partopsep=0pt,
+    leftmargin=*
+}
+
+\begin{document}
+
+\title{Progress Summary}
+
+\author{\IEEEauthorblockN{Jad Al Lakkis}}
+
+\maketitle
+\thispagestyle{empty}
+
+\begin{abstract}
+Progress since the last meeting: a working constrained-PPO baseline for tile-based 360-degree video streaming, implemented, trained, and validated, with measured results.
+\end{abstract}
+
+\section{Implementation}
+
+\noindent\textbf{Environment.} Gymnasium environment for the Runner video: 12 valid head-movement traces, 64 tiles/frame (8$\times$8), 30 fps, 30-frame GOPs = 1 s/slot. Integrates the Rician-fading channel model, buffer/stall dynamics, viewport-coverage computation, and the per-tile rate-distortion (QP-level) layer model into one step function.
+
+\smallskip
+\noindent\textbf{State/action.} $\omega^t=(Z^t,\Delta_\theta^{t-1},\Delta_\phi^{t-1},h^t)$: buffer level, previous-step prediction error (both angles), channel gain. Action: 64-tile enhance mask + 1 of 5 discrete transmit-power levels (0/25/50/75/100\% of $P_{\max}$). Tiles overlapping the predicted viewport are enhanced unconditionally (eq.~2); the agent only chooses among the rest.
+
+\smallskip
+\noindent\textbf{Constraint calibration.} $\bar D,\bar P,\bar B$ derived experimentally, not assumed: 3 reference tile policies (mandatory-only / +50\% random / all tiles) $\times$ 3 power levels, run on the 9 training traces with fixed seeds, measuring the exact discounted $J_D,J_P,J_B$. Values chosen inside the resulting efficient/wasteful range (Table~\ref{tab:budgets}).
+
+\smallskip
+\noindent\textbf{Training.} PPO (Stable-Baselines3), 2{,}048-step rollouts ($\approx$57 episodes each, each episode 36 steps). Every step uses the Lagrangian reward
+\[
+r_{\mathrm L}^t=\beta_q\bar Q^t_{\text{viewport}}-\mu_D\frac{D^t}{T_0}-\mu_P\frac{P^t}{P_{\max}}-\mu_B\frac{\sum_i x_i^t}{N},
+\]
+with $\mu_D,\mu_P,\mu_B$ updated once per rollout by projected dual ascent on that rollout's average constraint costs:
+\[
+\mu_j \leftarrow \max\!\Bigl(0,\ \mu_j+\eta\bigl(\overline{J_j}^{\,\text{rollout}}-\bar b_j\bigr)\Bigr),\ \ j\in\{D,P,B\}.
+\]
+Observations normalized online (VecNormalize), fit on training traces only, frozen at validation. 3 of 12 traces held out for validation with fixed seeds, evaluated every rollout -- results in Tables~\ref{tab:startend}--\ref{tab:rollouts}. Best checkpoint kept by feasibility first, then highest $J_Q$.
+
+\section{Formulation}
+\[
+\max_\pi J_Q \quad \text{s.t.} \quad J_D\le\bar D,\ J_P\le\bar P,\ J_B\le\bar B
+\]
+Solved via Lagrangian relaxation; the resulting reward and multiplier update are given in the Training paragraph above. $\bar D,\bar P,\bar B$ enter only the update, not the per-step reward directly.
+
+\begin{table}[H]
+\centering
+\footnotesize
+\begin{tabular}{lccc}
+\toprule
+Budget & Efficient & Wasteful & Chosen \\
+\midrule
+$\bar D$ (stall) & $\approx0.00$ & $\approx0.60$ & $\mathbf{0.10}$ \\
+$\bar P$ (power) & $0.00$--$0.505$ (min/mid) & $1.01$ (max) & $\mathbf{0.60}$ \\
+$\bar B$ (tiles) & $\approx0.23$ & $\approx1.01$ & $\mathbf{0.35}$ \\
+\bottomrule
+\end{tabular}
+\caption{Calibrated constraint budgets.}
+\label{tab:budgets}
+\end{table}
+
+\section{Training and Results}
+Runs of 50K, 300K, and 700K steps. Validation feasibility: $0/25\to0/147\to140/342$, with the final 20/20 evaluations feasible in the 700K run. The best-feasible checkpoint is not always the last one: a 300K-run checkpoint at 294{,}912 steps had lower violation ($\approx0.057$) than that run's own final step.
+
+\begin{table}[H]
+\centering
+\footnotesize
+\begin{tabular}{lccc}
+\toprule
+\textbf{Metric (700K run)} & \textbf{Start} & \textbf{End} & \textbf{$\Delta$} \\
+\midrule
+Feasible & No & Yes & -- \\
+Coverage & 0.927 & 0.882 & $-4.9\%$ \\
+Stall (s) & 0.531 & 0.022 & $-95.9\%$ \\
+Power (mW) & 49.6 & 27.6 & $-44.4\%$ \\
+Enhanced tiles & 39.1 & 19.0 & $-51.4\%$ \\
+\bottomrule
+\end{tabular}
+\caption{Physical training metrics, start vs.\ end of the 700K run.}
+\label{tab:startend}
+\end{table}
+
+\noindent Multipliers: $\mu_D$ 1.00$\to$1.71, $\mu_B$ 1.00$\to$1.46 (still exerting pressure); $\mu_P$ 1.00$\to$0.009 (power constraint slack at $\bar P=0.6$). PPO's explained variance rose from $\approx0$ to $0.41$.
+
+\begin{table}[H]
+\centering
+\scriptsize
+\begin{tabular}{lccccc}
+\toprule
+Rollout & Feas. & Cov. & Stall(s) & Pwr(mW) & Tiles \\
+\midrule
+1   & 0 & 0.918 & 0.422 & 72.9 & 39.6 \\
+2   & 0 & 0.926 & 0.602 & 33.3 & 36.6 \\
+341 & 1 & 0.841 & 0.001 & 25.0 & 17.1 \\
+342 & 1 & 0.840 & 0.001 & 25.0 & 17.0 \\
+\bottomrule
+\end{tabular}
+\caption{First/last 2 of 342 validation rollouts, 700K run (step = rollout $\times$ 2{,}048). Full log: \texttt{runs/train\_700k/train\_700k\_key\_metrics.csv}.}
+\label{tab:rollouts}
+\end{table}
+
+\section{Questions}
+\begin{itemize}
+    \item Keep $\lambda=0.01$, or change it -- recalibrate the budgets if so?
+    \item Are these the right validation metrics to be tracking?
+    \item Tighten $\bar P$, or narrow the power action range (e.g.\ 0--50\%, still 5 slots), given $\mu_P\to0$?
+\end{itemize}
+
+\section{Next Steps}
+\begin{enumerate}
+    \item Decide on further training length beyond 700K.
+    \item Resolve the questions above.
+    \item Compare PPO vs.\ PPO + PDS + VE under a matched protocol.
+\end{enumerate}
+
+\end{document}

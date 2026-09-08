@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.pyc
+.claude/settings.local.json
+
+# Training outputs: binary model.zip/vecnormalize.pkl checkpoints don't
+# belong in git and grow unbounded across sweep arms - pull results off
+# RunPod directly (runpodctl send / scp), not via git. data/ (the .mat
+# dataset) stays tracked - it's small (79MB) and needed for training.
+runs/
+other/archived_runs/
+*.zip
+*.pkl
+
+# Empty sentinel files from local auto-continue loop control, not
+# meaningful outside this machine's now-superseded local sweep.
+other/STOP_*
