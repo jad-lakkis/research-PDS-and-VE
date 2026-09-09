@@ -1,15 +1,31 @@
 """
-One-command orchestrator for the Stage 9 D-bar sweep (see the plan and
-other/decision_log.md #21+). Launches every configured D-bar value as a
-parallel training arm, auto-chains resumed blocks per arm until that
-arm's own convergence check passes (or a hard rollout cap is hit), then
-extracts final_results (CSV + a summary graph) per arm and one top-level
-sweep comparison once every arm has stopped.
+One-command orchestrator for the Stage 9 RunPod joint D-bar/P-bar/B-bar
+sweep (see other/decision_log.md #21-22 and the D-bar-only sweep this
+supersedes). Launches every configured arm as a PARALLEL training run
+(true OS subprocesses, not threads doing the compute - threading here
+just avoids blocking between the concurrent subprocess.run() calls),
+each auto-chaining resumed blocks until that arm's own convergence
+check passes (or a hard rollout cap is hit), then extracts
+final_results (CSV + a summary graph) per arm and one top-level sweep
+comparison once every arm has stopped.
 
-Usage: python run_sweep.py
+Sized for a 4-vCPU RunPod CPU pod: 3 arms running concurrently (1 core
+each) + 1 core of headroom for the OS/this orchestrator process.
+
+Why this file is separate from run_sweep.py (not a shared/edited copy):
+run_sweep.py is the LOCAL laptop's own joint D-bar/P-bar test (2 arms,
+sequential, different ARMS) - kept local, uncommitted, deliberately not
+pushed. Sharing one filename between two machines running different
+configs off the same git remote is a real hazard (a `git pull` on
+either machine would silently overwrite the other's config). This file
+is RunPod-only and can be committed/pushed safely alongside the
+laptop's local edits to run_sweep.py without colliding.
+
+Usage (on the RunPod pod): python run_sweep_runpod.py
 """
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -20,29 +36,43 @@ ROOT = Path(__file__).resolve().parent
 PYTHON = sys.executable
 
 # ---------------------------------------------------------------------
-# Sweep configuration - edit this list to change what's swept (e.g. for
-# the future P-bar round: hold d_bar fixed at the chosen best value,
-# vary p_bar instead, and set SWEPT_MULTIPLIER = "lagrangian/mu_P").
+# Sweep configuration - edit this list to change what's run.
 # Every arm's fixed parameters are baked into its folder name so nothing
 # needs opening a file to know which experiment produced which output.
 # ---------------------------------------------------------------------
-SWEEP_PARENT = ROOT / "runs" / "stage9_joint_test_local"
-# Sequential this time (not parallel) - run 1 finishes (converges or hits
-# the cap) before run 2 starts at all, per explicit user request, so each
-# gets the full machine and results aren't confounded by CPU contention.
-# Test 1 (aggressive): all three budgets tightened together, two pulling
-# in opposite directions (tighter D-bar wants more power; tighter P-bar
-# forbids it) - deliberately the harder, more informative stress test.
-# Test 2 (safer): D-bar=0.30 already converges cleanly on its own (fully
-# tested already); only adding a P-bar tightening on top of that known-
-# good baseline - the controlled contrast case if test 1 turns out messy.
+SWEEP_PARENT = ROOT / "runs" / "stage9_joint_sweep_runpod"
+# Supersedes the earlier D-bar-only RunPod plan (0.02/0.10/0.15, P-bar/
+# B-bar left at the loose config.py defaults 10.0/10.2) - that design
+# was dropped per explicit user feedback: leaving P-bar/B-bar loose lets
+# mu_P/mu_B decay to exactly 0 (same pattern already seen in run1 and
+# dbar_0.30 - decision_log #20), so a D-bar-only sweep never exercises
+# two-thirds of the Lagrangian mechanism. These arms instead tighten all
+# three budgets together, every value grounded in real percentiles of
+# run1's own converged-tail J_D/J_P/J_B (rollout 2001-2638, ALL-loose
+# baseline: D-bar=3.2/P-bar=10.0/B-bar=10.2) - not round-number guesses.
+# Both P-bar and B-bar stay above their hard physical floors (~3.8 for
+# P-bar at minimum power every step; ~6.57 for B-bar, the mandatory-
+# predicted-viewport-only floor) - below those the constraint would be
+# unsatisfiable regardless of policy, not just difficult.
+# NOTE (flagged, not yet resolved): these percentiles were measured
+# under a LOOSE D-bar=3.2. Tightening D-bar is already known to push
+# J_P/J_B up on its own (dbar_0.30 and dbar_0.05 both showed this
+# without P-bar/B-bar ever being touched) - so once D-bar is ALSO
+# tightened in the same arm, real achieved J_P/J_B will likely land
+# higher than these percentiles suggest, i.e. the effective constraint
+# is tighter than "p70"/"p30" implies. Some arms may hit MAX_ROLLOUTS
+# without converging (as dbar_0.05 did) - that is an informative result
+# here, not a failure.
 ARMS = [
-    {"d_bar": 0.10, "p_bar": 6.5, "b_bar": 8.0, "seed": 0},
-    {"d_bar": 0.30, "p_bar": 8.0, "b_bar": 10.2, "seed": 0},
+    # p70-ish joint tightening at a new D-bar point (fills the untested
+    # 0.05-0.30 gap)
+    {"d_bar": 0.15, "p_bar": 7.0, "b_bar": 7.7, "seed": 0},
+    # milder (p80-ish) joint tightening at a different new D-bar point
+    {"d_bar": 0.20, "p_bar": 7.5, "b_bar": 7.9, "seed": 0},
+    # same D-bar as arm 1, P-bar/B-bar pulled much tighter (p30-ish) -
+    # the deliberately aggressive stress case
+    {"d_bar": 0.15, "p_bar": 6.3, "b_bar": 7.4, "seed": 0},
 ]
-# Arms here vary D-bar and/or P-bar (and sometimes B-bar) together, so
-# convergence requires ALL THREE multipliers flat, not just one - see
-# check_converged below.
 
 FIRST_BLOCK_ROLLOUTS = 700   # matches this project's established fresh-start block size
 BLOCK_ROLLOUTS = 500         # matches established resumed-block size
@@ -68,8 +98,8 @@ def check_converged(df: pd.DataFrame) -> bool:
     and holding, and every multiplier has stopped moving (not just slowed
     down) over a real recent window - not a single-rollout snapshot, which
     is noisy (see decision_log #21's own false-plateau-read lesson). Checks
-    all three multipliers (not just one) since arms here can tighten D-bar
-    and/or P-bar together."""
+    all three multipliers (not just one), since every arm here jointly
+    tightens D-bar, P-bar, and B-bar together."""
     if len(df) < CONVERGENCE_WINDOW:
         return False
     tail = df.tail(CONVERGENCE_WINDOW)
@@ -208,10 +238,13 @@ def build_sweep_comparison():
             "arm": arm_name(arm),
             "d_bar": arm["d_bar"],
             "p_bar": arm["p_bar"],
+            "b_bar": arm["b_bar"],
             "total_rollouts": len(df),
             "converged": (arm_dir / "STOPPED_CONVERGED").exists(),
             "hit_cap": (arm_dir / "STOPPED_CAPPED").exists(),
             "final_J_D": tail["eval/J_D"].mean(),
+            "final_J_P": tail["eval/J_P"].mean(),
+            "final_J_B": tail["eval/J_B"].mean(),
             "final_mu_D": tail["lagrangian/mu_D"].mean(),
             "final_mu_P": tail["lagrangian/mu_P"].mean(),
             "final_mu_B": tail["lagrangian/mu_B"].mean(),
@@ -226,31 +259,20 @@ def build_sweep_comparison():
     out_dir = SWEEP_PARENT / "sweep_comparison"
     out_dir.mkdir(parents=True, exist_ok=True)
     comp.to_csv(out_dir / "sweep_comparison.csv", index=False)
-
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
-    axes[0].plot(comp["d_bar"], comp["final_J_D"], "o-")
-    axes[0].plot(comp["d_bar"], comp["d_bar"], "--", color="gray", label="budget")
-    axes[0].set_xlabel("D-bar"); axes[0].set_ylabel("achieved J_D"); axes[0].legend()
-    axes[1].plot(comp["d_bar"], comp["final_mu_D"], "o-", color="tab:blue")
-    axes[1].axhline(0, color="black", ls="--", lw=0.8)
-    axes[1].set_xlabel("D-bar"); axes[1].set_ylabel("final mu_D")
-    axes[2].plot(comp["d_bar"], comp["total_rollouts"], "o-", color="tab:green")
-    axes[2].set_xlabel("D-bar"); axes[2].set_ylabel("rollouts to stop")
-    plt.tight_layout()
-    plt.savefig(out_dir / "sweep_comparison.png")
-    plt.close()
     print(f"Sweep comparison written to {out_dir}")
 
 
 def main():
-    # Sequential, not parallel: run 2 only starts once run 1 has fully
-    # stopped (converged or hit the cap) - per explicit user request, so
-    # each arm gets the whole machine and isn't slowed by CPU contention.
-    for arm in ARMS:
-        run_arm(arm)
+    # Parallel, not sequential: this pod is sized (4 vCPUs) specifically
+    # for these 3 arms to run concurrently, one real core each, +1 core
+    # of headroom - see module docstring. Each thread just blocks on its
+    # own subprocess.run() call; the actual training work happens in
+    # separate OS processes, not in these threads.
+    threads = [threading.Thread(target=run_arm, args=(arm,), name=arm_name(arm)) for arm in ARMS]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
     build_sweep_comparison()
     print("SWEEP DONE")
 
