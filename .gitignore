@@ -9,6 +9,9 @@ __pycache__/
 # dataset) stays tracked - it's small (79MB) and needed for training.
 runs/
 other/archived_runs/
+runpod_results/
+runpod_results_v2/
+runpod_results_summary/
 *.zip
 *.pkl
 
