@@ -221,6 +221,10 @@ class TileStreamingEnv(gym.Env):
         # --- reveal the random outcome for time t ---
         actual_theta_t, actual_phi_t = self._actual_theta_phi(t)
         coverage_t = viewport.coverage(tile_mask, actual_theta_t, actual_phi_t)
+        viewport_psnr_db = layer_model.compute_viewport_psnr_db(
+            self._rd_data, config.TRAINING_VIDEO_ARRAY_INDEX, t, tile_mask,
+            self._enhanced_level, actual_theta_t, actual_phi_t,
+        )
         delta_theta_t = abs(actual_theta_t - self._predicted_theta)
         delta_phi_t = abs(actual_phi_t - self._predicted_phi)
         r_random = config.BETA_Q * coverage_t
@@ -265,6 +269,7 @@ class TileStreamingEnv(gym.Env):
             "R_t": R_t,
             "D_t": D_t,
             "coverage": coverage_t,
+            "viewport_psnr_db": viewport_psnr_db,
             "tile_mask": tile_mask.astype(np.uint8),  # which of the 64 tiles, for Stage 8 per-tile tracking
             "n_enhanced_tiles": int(tile_mask.sum()),
             "n_mandatory_tiles": int(mandatory_tile_mask.sum()),

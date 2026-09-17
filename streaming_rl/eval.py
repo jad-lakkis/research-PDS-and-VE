@@ -44,6 +44,7 @@ class EpisodeResult:
     mean_stall_sec: float
     mean_power_mw: float
     mean_n_tiles: float
+    mean_psnr_db: float
     J_Q: float
     J_D: float
     J_P: float
@@ -58,7 +59,7 @@ def run_eval_episode(env: TileStreamingEnv, model, vecnormalize, seed: int,
     VecNormalize wiring lands, or when training with observations left
     raw); when present, only its read-only normalize_obs() is used."""
     obs, _info = env.reset(seed=seed)
-    coverages, stalls_sec, powers_mw, n_tiles = [], [], [], []
+    coverages, stalls_sec, powers_mw, n_tiles, psnr_db = [], [], [], [], []
     terminated = truncated = False
     info = {}
     while not (terminated or truncated):
@@ -69,6 +70,7 @@ def run_eval_episode(env: TileStreamingEnv, model, vecnormalize, seed: int,
         stalls_sec.append(info["D_t"])
         powers_mw.append(info["power_watts"] * 1000.0)
         n_tiles.append(info["n_enhanced_tiles"])
+        psnr_db.append(info["viewport_psnr_db"])
 
     for key in ("J_Q", "J_D", "J_P", "J_B"):
         assert key in info, (
@@ -80,6 +82,7 @@ def run_eval_episode(env: TileStreamingEnv, model, vecnormalize, seed: int,
         trace_position=trace_position, seed=seed, steps=len(coverages),
         mean_coverage=float(np.mean(coverages)), mean_stall_sec=float(np.mean(stalls_sec)),
         mean_power_mw=float(np.mean(powers_mw)), mean_n_tiles=float(np.mean(n_tiles)),
+        mean_psnr_db=float(np.mean(psnr_db)),
         J_Q=float(info["J_Q"]), J_D=float(info["J_D"]), J_P=float(info["J_P"]), J_B=float(info["J_B"]),
     )
 
@@ -154,6 +157,7 @@ class HeldOutTraceEvalCallback(BaseCallback):
             ("mean_stall_sec", float(np.mean([r.mean_stall_sec for r in results]))),
             ("mean_power_mw", float(np.mean([r.mean_power_mw for r in results]))),
             ("mean_n_tiles", float(np.mean([r.mean_n_tiles for r in results]))),
+            ("mean_psnr_db", float(np.mean([r.mean_psnr_db for r in results]))),
         ]:
             self.logger.record(f"eval/{name}", val)
 

@@ -1,5 +1,6 @@
 """
-layer_model.py - base/enhancement-layer data-volume computation (A^t).
+layer_model.py - base/enhancement-layer data-volume (A^t) and viewport
+quality (PSNR) computation.
 
 Implements the professor-confirmed model (config.py, "Base /
 enhancement-layer (QP) model" section): every tile is sent at the base
@@ -23,11 +24,19 @@ For the first implementation, only config.INITIAL_ENHANCEMENT_LEVELS
 (k=0 and k=1) are used - i.e. the action is effectively a binary
 per-tile choice (stay at base, or move to k=1) rather than the full
 k=0..6 graduated range the mapping function already supports.
+
+compute_viewport_psnr_db (added later, same file since it needs the
+same rd_data/QP-index plumbing as compute_A_t) turns rd.mat's real,
+per-(QP, tile, frame) Y-MSE data into a single viewport-PSNR number per
+step, verified directly against the loaded data before being wired in
+(zero NaNs for Runner, MSE values in a plausible sub-1 to low-teens
+range, see other/decision_log.md).
 """
 
 import numpy as np
 
 import config
+from streaming_rl import viewport
 
 
 def frame_index_for_gop(gop_index: int) -> int:
@@ -79,3 +88,48 @@ def compute_A_t(rd_data: dict, video_array_index: int, gop_index: int,
         "enhanced_bitrate": enhanced_bitrate,
         "delta": delta,
     }
+
+
+def compute_viewport_psnr_db(rd_data: dict, video_array_index: int, gop_index: int,
+                              enhanced_tile_mask: np.ndarray, enhanced_level: int,
+                              theta_deg: float, phi_deg: float) -> float:
+    """Viewport PSNR (dB) for one GOP.
+
+    Looks up each tile's real Y-MSE (rd_data["video_ymse_data"], shape
+    (N_QP_LEVELS, N_TILES, n_frames), verified against the actual loaded
+    data - zero NaNs, plausible MSE range) at whichever QP level that
+    tile was actually sent this step: base QP if not enhanced, the
+    enhanced_level's QP if enhanced - same base/enhanced split compute_A_t
+    already uses. Pools those per-tile MSE values into one area-weighted
+    average MSE across the actual viewport, using the SAME per-tile
+    overlap fractions viewport.coverage() weights C^t_cov by
+    (viewport.tile_overlap_fractions) - not a separate/different
+    weighting scheme. Applies one PSNR conversion at the end, not an
+    average of per-tile PSNR values: PSNR is already a log10 transform,
+    so a mean of dB numbers isn't a physically meaningful average error;
+    pooling in MSE space first is the standard convention (how frame-
+    level PSNR is computed from block MSEs in video quality assessment).
+
+    MAX_I=255: Runner is 8-bit (other/Readme - Dataset info.txt, video
+    catalog table), confirmed, not assumed.
+    """
+    mask = np.asarray(enhanced_tile_mask, dtype=bool)
+    assert mask.shape == (config.N_TILES,), f"expected shape ({config.N_TILES},), got {mask.shape}"
+
+    frame_idx = frame_index_for_gop(gop_index)
+    base_qp_idx = config.BASE_QP_ARRAY_INDEX
+    enhanced_qp_idx = config.qp_array_index_for_enhancement_level(enhanced_level)
+    ymse = rd_data["video_ymse_data"][video_array_index]  # (N_QP_LEVELS, N_TILES, n_frames)
+    per_tile_mse = np.where(mask, ymse[enhanced_qp_idx, :, frame_idx], ymse[base_qp_idx, :, frame_idx])
+
+    fractions = viewport.tile_overlap_fractions(theta_deg, phi_deg)
+    total_frac = float(fractions.sum())
+    if total_frac <= 0.0:
+        # Degenerate case, not expected in practice (the viewport rectangle
+        # always has positive area and therefore always overlaps some
+        # tile), guarded rather than silently trusted.
+        return float("nan")
+
+    pooled_mse = float(np.sum(fractions * per_tile_mse) / total_frac)
+    max_i = 255.0
+    return float(10.0 * np.log10((max_i ** 2) / pooled_mse))

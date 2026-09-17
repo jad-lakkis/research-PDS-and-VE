@@ -252,6 +252,13 @@ ALGORITHM = "PPO"               # per the original meeting plan
 N_CRITICS_BASELINE = 1
 N_CRITICS_WITH_PDS = 2
 
+# Stage 2 critic's own hidden-layer sizes (streaming_rl/pds_policy.py) -
+# fully separate small MLP, no shared trunk with the actor/ordinary critic
+# (PDS design plan, Section 6 - matches the EHS paper's own choice of
+# fully separate [128,128]/[64,64] architectures; our own actor/ordinary
+# critic use SB3's default [64,64] too, unchanged).
+PDS_CRITIC_ARCHITECTURE = [64, 64]
+
 ACTION_MODE = "discrete"        # start discrete/binned (per the original meeting)
                                  # before moving to continuous
 
