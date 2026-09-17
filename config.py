@@ -267,6 +267,33 @@ N_CRITICS_WITH_PDS = 2
 # with the user.
 PDS_CRITIC_ARCHITECTURE = [96, 64]
 
+# Entropy coefficient for PPOWithPDS's actor loss (streaming_rl/pds_ppo.py
+# train(), the existing ent_coef*entropy_loss term stock PPO already has -
+# just never given a nonzero value before now). Diagnostic finding (RunPod
+# sweep, 4 arms): under the one-step PDS advantage, policy entropy collapsed
+# 5-15x faster than the matched non-PDS baseline (which runs at PPO's
+# default ent_coef=0.0 the whole time, unchanged) - e.g. PDS entropy at
+# rollout ~100-300 already at the level baseline reaches around rollout
+# ~1500-2000. Root cause (not yet certain, being tested): the one-step PDS
+# advantage has lower variance than baseline's gae_lambda=0.95 once both
+# critics are reasonably well-fit (confirmed via explained_variance~0.8),
+# producing a more consistent/confident gradient every update and thus
+# faster entropy collapse - plausibly leaving too little residual
+# exploration for the policy to keep responding to the still-rising
+# constraint multipliers (mu_D specifically stayed persistently violated
+# in multiple arms despite mu_D correctly climbing).
+#
+# NOT copied from EHS's Table I entropy coefficient (alpha=0.01, their SAC
+# temperature): that number doesn't transfer 1:1 - SAC's alpha enters both
+# the actor loss AND the soft critic's bootstrap target, while PPO's
+# ent_coef only touches the actor loss, and EHS's action space is ~9
+# discrete choices vs. our 2^64*5 (plausibly needing more, not the same,
+# exploration pressure). 0.05 is a first working value picked given the
+# unusually severe (5-15x) collapse observed - confirmed with the user,
+# who is running it alongside 0.03/0.08 as a small sweep, not a single
+# committed choice. Overridable per run via train_ppo_pds.py's --ent-coef.
+PDS_ENTROPY_COEF = 0.05
+
 ACTION_MODE = "discrete"        # start discrete/binned (per the original meeting)
                                  # before moving to continuous
 

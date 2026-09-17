@@ -48,6 +48,11 @@ def parse_args():
     p.add_argument("--d-bar", type=float, default=None, help="overrides config.D_BAR for this run")
     p.add_argument("--p-bar", type=float, default=None, help="overrides config.P_BAR for this run")
     p.add_argument("--b-bar", type=float, default=None, help="overrides config.B_BAR for this run")
+    p.add_argument("--ent-coef", type=float, default=None,
+                    help="overrides config.PDS_ENTROPY_COEF for this run - PPOWithPDS's actor-loss "
+                         "entropy coefficient (stock PPO's own ent_coef*entropy_loss term, previously "
+                         "always 0.0 here); only meaningful on a fresh start, not --resume-from, since "
+                         "a resumed run keeps its own already-baked-in value")
     p.add_argument("--eval-freq-rollouts", type=int, default=1,
                     help="run held-out-trace evaluation every N rollouts")
     p.add_argument("--log-dir", type=str, default="runs/ppo_pds_run")
@@ -64,6 +69,7 @@ def main():
     d_bar = args.d_bar if args.d_bar is not None else config.D_BAR
     p_bar = args.p_bar if args.p_bar is not None else config.P_BAR
     b_bar = args.b_bar if args.b_bar is not None else config.B_BAR
+    ent_coef = args.ent_coef if args.ent_coef is not None else config.PDS_ENTROPY_COEF
 
     bundle = data_loader.load_training_video_bundle()
     n_traces = len(bundle["valid_traces"])
@@ -90,7 +96,9 @@ def main():
         train_venv = VecNormalize(train_venv, training=True, norm_obs=True, norm_reward=False,
                                    gamma=config.PPO_GAMMA)
         model = PPOWithPDS(env=train_venv, n_steps=args.n_steps, gamma=config.PPO_GAMMA,
-                            seed=args.seed, verbose=1, device=args.device)
+                            ent_coef=ent_coef, seed=args.seed, verbose=1, device=args.device)
+        print(f"Fresh start: d_bar={d_bar} p_bar={p_bar} b_bar={b_bar} ent_coef={ent_coef} "
+              f"pds_critic_architecture={config.PDS_CRITIC_ARCHITECTURE}")
     model.set_logger(sb3_configure(args.log_dir, ["stdout", "csv"]))
 
     callbacks = [
