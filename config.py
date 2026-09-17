@@ -254,10 +254,18 @@ N_CRITICS_WITH_PDS = 2
 
 # Stage 2 critic's own hidden-layer sizes (streaming_rl/pds_policy.py) -
 # fully separate small MLP, no shared trunk with the actor/ordinary critic
-# (PDS design plan, Section 6 - matches the EHS paper's own choice of
-# fully separate [128,128]/[64,64] architectures; our own actor/ordinary
-# critic use SB3's default [64,64] too, unchanged).
-PDS_CRITIC_ARCHITECTURE = [64, 64]
+# (PDS design plan, Section 6). NOT copied from the EHS paper's own
+# [64,64] PDS-critic number: their pre-decision/PDS state dimensionality
+# ratio isn't known to match ours, and [64,64] on our own 68-dim PDS input
+# (64 tile-mask flags + 4 continuous) would make the first hidden layer a
+# contraction (68->64) instead of an expansion - unlike the ordinary
+# critic's very generous 4->64 first layer. Widened to 96 so the first
+# layer expands the input instead, without over-provisioning: most of the
+# 68 dims are a sparse/structured binary tile mask (low actual entropy
+# relative to its raw width), so a large jump to 128 (EHS's OTHER,
+# pre-decision-critic number) isn't clearly justified either - confirmed
+# with the user.
+PDS_CRITIC_ARCHITECTURE = [96, 64]
 
 ACTION_MODE = "discrete"        # start discrete/binned (per the original meeting)
                                  # before moving to continuous
