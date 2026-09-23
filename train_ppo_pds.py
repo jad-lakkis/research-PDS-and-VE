@@ -63,6 +63,19 @@ def parse_args():
     p.add_argument("--gae-lambda", type=float, default=0.95,
                     help="GAE lambda for the PDS-residual advantage recursion (0 = original one-step "
                          "PDS advantage / Run C, 0.95 = PDS-GAE / Run D matching baseline PPO)")
+    # Optional stabilizer, default OFF (None = SB3's own default, no value
+    # clipping) - a standalone lever from --gae-lambda/--ent-coef, only
+    # meant to be turned on as its own separate, labeled comparison (a "D
+    # + clipping" arm) once a clean ent-coef=0 Run D has already been
+    # checked, not bundled into the same run as another change. SB3's own
+    # docstring: "this clipping depends on the reward scaling" - it's a
+    # raw-magnitude clip on (new_value - old_value), not a fraction like
+    # --clip-range, so pick it from this project's own healthy value/return
+    # scale (converged episode reward is O(10) in this project), not
+    # copied from clip_range's 0.2.
+    p.add_argument("--clip-range-vf", type=float, default=None,
+                    help="value-function clipping (raw units, depends on reward scale - see SB3 docs); "
+                         "None (default) = off, matching every run so far")
     p.add_argument("--eval-freq-rollouts", type=int, default=1,
                     help="run held-out-trace evaluation every N rollouts")
     p.add_argument("--log-dir", type=str, default="runs/ppo_pds_run")
@@ -106,10 +119,12 @@ def main():
         train_venv = VecNormalize(train_venv, training=True, norm_obs=True, norm_reward=False,
                                    gamma=config.PPO_GAMMA)
         model = PPOWithPDS(env=train_venv, n_steps=args.n_steps, gamma=config.PPO_GAMMA,
-                            gae_lambda=args.gae_lambda, ent_coef=ent_coef, seed=args.seed,
+                            gae_lambda=args.gae_lambda, ent_coef=ent_coef,
+                            clip_range_vf=args.clip_range_vf, seed=args.seed,
                             verbose=1, device=args.device)
         print(f"Fresh start: d_bar={d_bar} p_bar={p_bar} b_bar={b_bar} ent_coef={ent_coef} "
-              f"gae_lambda={args.gae_lambda} pds_critic_architecture={config.PDS_CRITIC_ARCHITECTURE}")
+              f"gae_lambda={args.gae_lambda} clip_range_vf={args.clip_range_vf} "
+              f"pds_critic_architecture={config.PDS_CRITIC_ARCHITECTURE}")
     model.set_logger(sb3_configure(args.log_dir, ["stdout", "csv"]))
 
     callbacks = [
