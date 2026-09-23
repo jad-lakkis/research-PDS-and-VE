@@ -59,8 +59,26 @@ from streaming_rl import data_loader, channel_model, layer_model, viewport
 class TileStreamingEnv(gym.Env):
     metadata = {"render_modes": []}
 
-    def __init__(self, enhanced_level: int = None, trace_indices: list = None, bundle: dict = None):
+    def __init__(self, enhanced_level: int = None, trace_indices: list = None, bundle: dict = None,
+                 log_counterfactual: bool = False):
         super().__init__()
+
+        # Eval-only diagnostic: when True, step() additionally reports what
+        # the viewport PSNR/coverage WOULD have been if only the mandatory
+        # predicted-viewport tiles had been enhanced (i.e. without any of
+        # the agent's own extra tile picks). Isolates what the learned
+        # policy's extra tiles actually buy, versus the reference paper's
+        # viewport-enlargement mechanism alone.
+        #
+        # PSNR/coverage ONLY - it does NOT re-simulate A_t, the buffer, or
+        # stalls under that counterfactual mask, so it is not a full
+        # "EL-alone policy" rollout, just the per-step quality delta.
+        #
+        # Default False so the training hot path (1728 steps/rollout) pays
+        # only one boolean test per step; enabled on the eval envs built in
+        # streaming_rl/eval.py::HeldOutTraceEvalCallback._init_callback,
+        # which run 3x36=108 steps per eval.
+        self._log_counterfactual = log_counterfactual
 
         # Which k level (config.qp_array_index_for_enhancement_level)
         # enhanced tiles are sent at. Defaults to
@@ -196,7 +214,16 @@ class TileStreamingEnv(gym.Env):
         # the PREDICTED (theta, phi), not the actual one - self._predicted_theta/
         # phi still hold the prediction that was live when the agent
         # chose this action (not overwritten until the end of this method).
-        mandatory_tile_mask = viewport.mandatory_tile_mask(self._predicted_theta, self._predicted_phi)
+        # Snapshot the prediction THIS step actually used, before the
+        # end-of-step block below overwrites self._predicted_theta/_phi
+        # with this step's actual angles ("last viewport as prediction").
+        # Without this snapshot, anything reading self._predicted_theta
+        # down in the info dict would get the NEXT step's prediction, and
+        # the logged prediction error would be identically zero forever.
+        pred_theta_used = self._predicted_theta
+        pred_phi_used = self._predicted_phi
+
+        mandatory_tile_mask = viewport.mandatory_tile_mask(pred_theta_used, pred_phi_used)
         tile_mask = agent_tile_mask | mandatory_tile_mask
 
         # --- known immediately after the action (the PDS omega~^t) ---
@@ -268,12 +295,30 @@ class TileStreamingEnv(gym.Env):
             "A_enh": a_result["A_enh"],
             "R_t": R_t,
             "D_t": D_t,
+            # Buffer level after this step. NOTE: bits, not seconds -
+            # Z_next = Z + T0*R_t - A_t with R_t a bitrate and A_t a
+            # bit-volume, even though MMSP'25's own notation reads as a
+            # playout-seconds buffer. Purely additive, for diagnostics.
+            "Z": Z_next,
             "coverage": coverage_t,
             "viewport_psnr_db": viewport_psnr_db,
             "tile_mask": tile_mask.astype(np.uint8),  # which of the 64 tiles, for Stage 8 per-tile tracking
             "n_enhanced_tiles": int(tile_mask.sum()),
             "n_mandatory_tiles": int(mandatory_tile_mask.sum()),
             "n_agent_extra_tiles": int((agent_tile_mask & ~mandatory_tile_mask).sum()),
+            # The two masks SEPARATELY (tile_mask above is their OR, so the
+            # agent's own picks aren't recoverable from it alone), plus the
+            # geometry needed to place them: which direction we PREDICTED
+            # the viewport would be (what mandatory_tile_mask was built
+            # from) versus where it ACTUALLY turned out to be. Both masks
+            # are freshly-allocated arrays already, so these are reference
+            # stores - no copy, no new computation on the hot path.
+            "agent_tile_mask": agent_tile_mask,
+            "mandatory_tile_mask": mandatory_tile_mask,
+            "predicted_theta": float(pred_theta_used),
+            "predicted_phi": float(pred_phi_used),
+            "actual_theta": float(actual_theta_t),
+            "actual_phi": float(actual_phi_t),
             "power_watts": power_watts,
             "r_known": r_known,
             "r_random": r_random,
@@ -281,6 +326,22 @@ class TileStreamingEnv(gym.Env):
             "cost_P": cost_P_t,
             "cost_B": cost_B_t,
         }
+
+        # Eval-only counterfactual (see __init__'s log_counterfactual):
+        # quality if ONLY the mandatory predicted-viewport tiles had been
+        # enhanced. Same call as the real viewport_psnr_db above, differing
+        # only in the mask, and evaluated against the same ACTUAL angles -
+        # so (viewport_psnr_db - viewport_psnr_db_el_only) is exactly the
+        # quality the agent's extra tile picks bought on this step.
+        if self._log_counterfactual:
+            info["viewport_psnr_db_el_only"] = layer_model.compute_viewport_psnr_db(
+                self._rd_data, config.TRAINING_VIDEO_ARRAY_INDEX, t, mandatory_tile_mask,
+                self._enhanced_level, actual_theta_t, actual_phi_t,
+            )
+            info["coverage_el_only"] = viewport.coverage(
+                mandatory_tile_mask, actual_theta_t, actual_phi_t
+            )
+
         if terminated:
             # Complete (not partial) discounted returns, only on the
             # terminal step - same idiom as SB3's own Monitor wrapper

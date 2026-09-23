@@ -262,5 +262,15 @@ class PPOWithPDS(PPO):
         self.logger.record("train/explained_variance", explained_var)
         self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
         self.logger.record("train/clip_range", clip_range)
+
+        # PDS variance-reduction evidence (PDSRolloutBuffer._compute_variance_diagnostics):
+        # is delta_pds actually lower-variance than the ordinary TD residual
+        # on the same rollout? Recorded on EVERY train() call from rollout 1
+        # so SB3's CSVOutputFormat never has to rewrite progress.csv for a
+        # newly-appearing key mid-run. The plain-PPO baseline never reaches
+        # this code path (it uses stock PPO.train()), so no shared-key
+        # coupling between the two methods.
+        for name, val in self.rollout_buffer.last_diagnostics.items():
+            self.logger.record(f"pds_diag/{name}", val)
         if self.clip_range_vf is not None:
             self.logger.record("train/clip_range_vf", clip_range_vf)

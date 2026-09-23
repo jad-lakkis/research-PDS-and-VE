@@ -45,14 +45,14 @@ def load_and_align(pds_path: str, baseline_path: str):
     base = pd.read_csv(baseline_path).rename(columns=BASELINE_RENAME)
 
     n = min(len(pds), len(base))
-    print(f"PDS run: {len(pds)} rollouts. Baseline run: {len(base)} rollouts. "
+    print(f"PDS run: {len(pds)} rollouts. PPO run: {len(base)} rollouts. "
           f"Truncating both to {n} rollouts for a matched comparison.")
     return pds.iloc[:n].reset_index(drop=True), base.iloc[:n].reset_index(drop=True)
 
 
 def plot_violation(pds: pd.DataFrame, base: pd.DataFrame, out_dir: str) -> None:
     fig, ax = plt.subplots(figsize=(11, 4.5))
-    ax.plot(base["rollout"], base["violation"], color="gray", label="baseline (no PDS)")
+    ax.plot(base["rollout"], base["violation"], color="gray", label="PPO")
     ax.plot(pds["rollout"], pds["violation"], color="firebrick", label="PDS")
     ax.axhline(0, color="black", ls="--", lw=0.8)
     ax.set_title(r"violation = max(0, $J_D-\bar D$) + max(0, $J_P-\bar P$) + max(0, $J_B-\bar B$)")
@@ -71,7 +71,7 @@ def plot_constraint_returns(pds: pd.DataFrame, base: pd.DataFrame, d_bar: float,
              ("J_B", b_bar, "tab:green", r"$J_B$ (tiles)", "02c_J_B_vs_Bbar.png")]
     for col, budget, color, label, fname in specs:
         fig, ax = plt.subplots(figsize=(11, 4.5))
-        ax.plot(base["rollout"], base[col], color="gray", label="baseline")
+        ax.plot(base["rollout"], base[col], color="gray", label="PPO")
         ax.plot(pds["rollout"], pds[col], color=color, label="PDS")
         ax.axhline(budget, color="red", ls="--", label=f"budget = {budget}")
         ax.set_title(f"Discounted constraint return {label} vs. its budget")
@@ -92,7 +92,7 @@ def plot_multipliers(pds: pd.DataFrame, base: pd.DataFrame, out_dir: str) -> Non
              ("mu_P", "tab:orange", r"$\mu_P$ (power)"),
              ("mu_B", "tab:green", r"$\mu_B$ (tiles)")]
     for ax, (col, color, label) in zip(axes, specs):
-        ax.plot(base["rollout"], base[col], color="gray", label="baseline")
+        ax.plot(base["rollout"], base[col], color="gray", label="PPO")
         ax.plot(pds["rollout"], pds[col], color=color, label="PDS")
         ax.set_ylabel(label)
         ax.legend()
@@ -107,14 +107,14 @@ def plot_physical(pds: pd.DataFrame, base: pd.DataFrame, out_dir: str) -> None:
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
     fig.suptitle("Physical metrics")
 
-    axes[0].plot(base["rollout"], base["coverage"], color="gray", label="baseline")
+    axes[0].plot(base["rollout"], base["coverage"], color="gray", label="PPO")
     axes[0].plot(pds["rollout"], pds["coverage"], color="tab:purple", label="PDS")
     axes[0].set_title("Coverage (fraction)")
     axes[0].set_xlabel("rollout")
     axes[0].legend()
     axes[0].grid(True, alpha=0.3)
 
-    axes[1].plot(base["rollout"], base["enhanced_tiles"], color="gray", label="baseline")
+    axes[1].plot(base["rollout"], base["enhanced_tiles"], color="gray", label="PPO")
     axes[1].plot(pds["rollout"], pds["enhanced_tiles"], color="olive", label="PDS")
     axes[1].set_title("Enhanced tiles (of 64)")
     axes[1].set_xlabel("rollout")
@@ -128,7 +128,7 @@ def plot_physical(pds: pd.DataFrame, base: pd.DataFrame, out_dir: str) -> None:
 
 def plot_reward(pds: pd.DataFrame, base: pd.DataFrame, out_dir: str) -> None:
     fig, ax = plt.subplots(figsize=(11, 4.5))
-    ax.plot(base["rollout"], base["reward"], color="gray", label="baseline")
+    ax.plot(base["rollout"], base["reward"], color="gray", label="PPO")
     ax.plot(pds["rollout"], pds["reward"], color="teal", label="PDS")
     ax.set_title(r"$r^t = \beta_Q C_{cov}^t - \mu_D cost_D^t - \mu_P cost_P^t - \mu_B cost_B^t$")
     ax.set_xlabel("rollout")
@@ -155,7 +155,7 @@ def plot_psnr(pds: pd.DataFrame, out_dir: str) -> None:
 
 def plot_coverage_percent(pds: pd.DataFrame, base: pd.DataFrame, out_dir: str) -> None:
     fig, ax = plt.subplots(figsize=(11, 4.5))
-    ax.plot(base["rollout"], base["coverage"] * 100, color="gray", label="baseline")
+    ax.plot(base["rollout"], base["coverage"] * 100, color="gray", label="PPO")
     ax.plot(pds["rollout"], pds["coverage"] * 100, color="tab:purple", label="PDS")
     ax.set_title("Viewport coverage")
     ax.set_xlabel("rollout")

@@ -43,6 +43,10 @@ class PDSRolloutBufferSamples(NamedTuple):
 
 class PDSRolloutBuffer(RolloutBuffer):
     pds_obs_dim: int = PDS_OBS_DIM
+    # Populated by compute_pds_returns_and_advantage(); empty until then
+    # so PPOWithPDS.train() can log defensively without an AttributeError
+    # if the call order ever changes.
+    last_diagnostics: dict = {}
 
     def reset(self) -> None:
         super().reset()
@@ -167,6 +171,68 @@ class PDSRolloutBuffer(RolloutBuffer):
         # y^t = r_known^t + Vtilde_psi(omega~^t), since advantages+values
         # reduces to delta_pds+values = known_rewards+v_pds exactly.
         self.ordinary_returns = self.advantages + self.values          # R^t_PDS-GAE
+
+        self._compute_variance_diagnostics(delta_pds, v_next, next_non_terminal, gae_lambda)
+
+    def _compute_variance_diagnostics(self, delta_pds, v_next, next_non_terminal,
+                                      gae_lambda: float) -> None:
+        """Evidence for PDS's core claim: that delta_pds is a LOWER-VARIANCE
+        estimate than the ordinary TD residual. Computes what ordinary GAE
+        would have produced on this very same rollout and compares.
+
+        Uses only arrays already in scope - no extra network forward
+        passes, so this costs two vector ops and one backward recursion
+        over an already-collected rollout.
+
+        Results land in self.last_diagnostics for PPOWithPDS.train() to
+        log. Means are included alongside the stds deliberately: a
+        residual that is lower-variance but biased is NOT the claim, so
+        the means have to be inspectable too.
+        """
+        # Ordinary TD residual: the total reward (not the known/random
+        # split) plus the same bootstrap v_next the PDS critic target
+        # uses, minus the same ordinary-critic baseline.
+        delta_ordinary = self.rewards + self.gamma * v_next - self.values
+
+        adv_ordinary = np.zeros_like(self.values)
+        last_gae_lam = 0
+        for step in reversed(range(self.buffer_size)):
+            last_gae_lam = (delta_ordinary[step]
+                            + self.gamma * gae_lambda * next_non_terminal[step] * last_gae_lam)
+            adv_ordinary[step] = last_gae_lam
+
+        a_pds = self.advantages.flatten()
+        a_ord = adv_ordinary.flatten()
+
+        def _corr(x, y):
+            # np.corrcoef warns and returns nan on a zero-variance input;
+            # return nan explicitly instead of emitting a runtime warning
+            # every rollout.
+            if x.std() == 0.0 or y.std() == 0.0:
+                return float("nan")
+            return float(np.corrcoef(x, y)[0, 1])
+
+        std_pds = float(delta_pds.std())
+        std_ord = float(delta_ordinary.std())
+
+        self.last_diagnostics = {
+            "std_delta_pds": std_pds,
+            "std_delta_ordinary": std_ord,
+            "std_adv_pds": float(a_pds.std()),
+            "std_adv_ordinary": float(a_ord.std()),
+            # <1 means the PDS residual really is the lower-variance one.
+            "std_ratio_pds_over_ord": (std_pds / std_ord) if std_ord != 0.0 else float("nan"),
+            "corr_adv_pds_ord": _corr(a_pds, a_ord),
+            "sign_agreement": float(np.mean(np.sign(a_pds) == np.sign(a_ord))),
+            "mean_delta_pds": float(delta_pds.mean()),
+            "mean_delta_ordinary": float(delta_ordinary.mean()),
+            # Proves r_known + r_random == r_total exactly. If this drifts
+            # from 0 the known/random split is broken and the whole
+            # PDS-vs-ordinary comparison above is apples-to-oranges.
+            "reward_decomp_max_err": float(
+                np.abs(self.known_rewards + self.random_rewards - self.rewards).max()
+            ),
+        }
 
     def get(self, batch_size: int | None = None) -> Generator[PDSRolloutBufferSamples, None, None]:
         assert self.full, ""

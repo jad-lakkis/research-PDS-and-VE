@@ -334,6 +334,7 @@ def main():
         d_bar=d_bar, p_bar=p_bar, b_bar=b_bar,
         best_model_save_path=os.path.join(args.log_dir, "best"),
         eval_every_n_rollouts=args.eval_freq_rollouts,
+        log_dir=args.log_dir,
         verbose=1,
     ))
 
