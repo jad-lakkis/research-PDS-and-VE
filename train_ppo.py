@@ -45,7 +45,9 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 import config
 from streaming_rl import data_loader
 from streaming_rl.environment import TileStreamingEnv
-from streaming_rl.lagrangian import LagrangianRewardWrapper, dual_ascent_step
+from streaming_rl.lagrangian import (
+    LagrangianRewardWrapper, dual_ascent_step, mu_init_kwargs, parse_dropped_constraints,
+)
 from streaming_rl.eval import HeldOutTraceEvalCallback
 
 
@@ -60,9 +62,15 @@ class LagrangianMultiplierCallback(BaseCallback):
     one dual_ascent_step per multiplier.
     """
 
-    def __init__(self, d_bar: float, p_bar: float, b_bar: float, eta: float, verbose: int = 0):
+    def __init__(self, d_bar: float, p_bar: float, b_bar: float, eta: float,
+                 dropped_constraints: frozenset = frozenset(), verbose: int = 0):
         super().__init__(verbose)
         self.d_bar, self.p_bar, self.b_bar, self.eta = d_bar, p_bar, b_bar, eta
+        # Dropped constraints' multipliers stay pinned at their 0.0 init
+        # (set via mu_init_kwargs when the env was built) - dual ascent
+        # never touches them, so they never drift off 0 regardless of
+        # J_X. Genuine removal, not a loose budget.
+        self.dropped_constraints = frozenset(dropped_constraints)
         self._J_D_buffer: list = []
         self._J_P_buffer: list = []
         self._J_B_buffer: list = []
@@ -89,9 +97,12 @@ class LagrangianMultiplierCallback(BaseCallback):
         avg_J_B = sum(self._J_B_buffer) / n
 
         current = self.training_env.env_method("get_multipliers")[0]
-        new_mu_D = dual_ascent_step(current["mu_D"], avg_J_D, self.d_bar, self.eta)
-        new_mu_P = dual_ascent_step(current["mu_P"], avg_J_P, self.p_bar, self.eta)
-        new_mu_B = dual_ascent_step(current["mu_B"], avg_J_B, self.b_bar, self.eta)
+        new_mu_D = (0.0 if "D" in self.dropped_constraints
+                    else dual_ascent_step(current["mu_D"], avg_J_D, self.d_bar, self.eta))
+        new_mu_P = (0.0 if "P" in self.dropped_constraints
+                    else dual_ascent_step(current["mu_P"], avg_J_P, self.p_bar, self.eta))
+        new_mu_B = (0.0 if "B" in self.dropped_constraints
+                    else dual_ascent_step(current["mu_B"], avg_J_B, self.b_bar, self.eta))
         self.training_env.env_method("set_multipliers", mu_D=new_mu_D, mu_P=new_mu_P, mu_B=new_mu_B)
 
         for name, val in [("mu_D", new_mu_D), ("mu_P", new_mu_P), ("mu_B", new_mu_B),
@@ -205,16 +216,21 @@ class TileEnhancementTrackerCallback(BaseCallback):
         self._n_steps_this_rollout = 0
 
 
-def build_env(use_lagrangian: bool, trace_indices: list, bundle: dict):
+def build_env(use_lagrangian: bool, trace_indices: list, bundle: dict,
+              dropped_constraints: frozenset = frozenset()):
     """One (unvectorized) env, Monitor on the outside: Monitor(Lagrangian
     RewardWrapper(TileStreamingEnv(...))) or Monitor(TileStreamingEnv(...))
     for --no-lagrangian. Manual Monitor wrap is required (see module
     docstring: VecNormalize is itself a VecEnv, so PPO's auto Monitor+
     DummyVecEnv wrap never triggers once VecNormalize is in the stack).
+
+    dropped_constraints (see streaming_rl.lagrangian.parse_dropped_constraints)
+    pins that constraint's multiplier at 0 from construction - genuine
+    removal from the reward, not a loosened budget.
     """
     env = TileStreamingEnv(trace_indices=trace_indices, bundle=bundle)
     if use_lagrangian:
-        env = LagrangianRewardWrapper(env)
+        env = LagrangianRewardWrapper(env, **mu_init_kwargs(dropped_constraints))
     return Monitor(env)
 
 
@@ -267,12 +283,22 @@ def parse_args():
     # unset, this flag changes nothing for existing runs.
     p.add_argument("--gae-lambda", type=float, default=0.95,
                     help="GAE lambda for advantage estimation (0 = one-step, matching PDS's estimator)")
+    # Genuine removal of a constraint from the Lagrangian, not a loosened
+    # budget - see streaming_rl.lagrangian.parse_dropped_constraints for
+    # exactly what this does (pins that mu at 0 for the whole run, and
+    # excludes it from the feasibility/violation check).
+    p.add_argument("--drop-constraints", type=str, default="",
+                    help="comma-separated subset of D,P,B to remove entirely from the "
+                         "reward and feasibility check, e.g. 'P' or 'P,B' (default: none dropped)")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
     use_lagrangian = not args.no_lagrangian
+    dropped_constraints = parse_dropped_constraints(args.drop_constraints)
+    if dropped_constraints:
+        print(f"Dropping constraints entirely (not just loosening): {sorted(dropped_constraints)}")
 
     d_bar = args.d_bar if args.d_bar is not None else config.D_BAR
     p_bar = args.p_bar if args.p_bar is not None else config.P_BAR
@@ -303,7 +329,8 @@ def main():
     # process boundary. Each lambda is independent (no closure/late-binding
     # issue - none of them close over a per-iteration loop variable).
     train_venv = DummyVecEnv([
-        lambda: build_env(use_lagrangian, train_indices, bundle) for _ in range(args.n_envs)
+        lambda: build_env(use_lagrangian, train_indices, bundle, dropped_constraints)
+        for _ in range(args.n_envs)
     ])
 
     if args.resume_from is not None:
@@ -329,12 +356,14 @@ def main():
     if use_lagrangian:
         callbacks.append(LagrangianMultiplierCallback(
             d_bar=d_bar, p_bar=p_bar, b_bar=b_bar, eta=config.MU_LEARNING_RATE,
+            dropped_constraints=dropped_constraints,
         ))
     callbacks.append(HeldOutTraceEvalCallback(
         d_bar=d_bar, p_bar=p_bar, b_bar=b_bar,
         best_model_save_path=os.path.join(args.log_dir, "best"),
         eval_every_n_rollouts=args.eval_freq_rollouts,
         log_dir=args.log_dir,
+        dropped_constraints=dropped_constraints,
         verbose=1,
     ))
 

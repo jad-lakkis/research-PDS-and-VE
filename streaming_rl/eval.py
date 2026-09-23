@@ -208,7 +208,8 @@ class HeldOutTraceEvalCallback(BaseCallback):
                  p_bar: float = config.P_BAR, b_bar: float = config.B_BAR,
                  best_model_save_path: str = "runs/best", eval_every_n_rollouts: int = 1,
                  feasibility_tol: float = 1e-9, log_dir: str = None,
-                 spatial_log_every_n_rollouts: int = 150, verbose: int = 0):
+                 spatial_log_every_n_rollouts: int = 150,
+                 dropped_constraints: frozenset = frozenset(), verbose: int = 0):
         super().__init__(verbose)
         assert len(eval_trace_indices) == len(eval_seeds), (
             "eval_trace_indices and eval_seeds must be the same length (one seed per held-out trace)"
@@ -219,6 +220,14 @@ class HeldOutTraceEvalCallback(BaseCallback):
         self.best_model_save_path = best_model_save_path
         self.eval_every_n_rollouts = eval_every_n_rollouts
         self.feasibility_tol = feasibility_tol
+        # A dropped constraint is excluded from BOTH the feasibility check
+        # and the checkpoint-selection violation sum below - a run that
+        # never had power in its reward shouldn't be judged infeasible
+        # for using a lot of it. J_P/mean_power_mw etc. are still logged
+        # normally (see run_eval_episode/EpisodeResult) so the dropped
+        # constraint's actual behavior remains visible for comparison,
+        # it just doesn't gate feasibility or best-checkpoint selection.
+        self.dropped_constraints = frozenset(dropped_constraints)
         # Where eval_steps.csv goes. Falls back to the parent of
         # best_model_save_path (which is <log_dir>/best) so existing
         # callers that don't pass log_dir still land in the run's own dir.
@@ -276,8 +285,10 @@ class HeldOutTraceEvalCallback(BaseCallback):
         J_D = float(np.mean([r.J_D for r in results]))
         J_P = float(np.mean([r.J_P for r in results]))
         J_B = float(np.mean([r.J_B for r in results]))
-        violation = (max(0.0, J_D - self.d_bar) + max(0.0, J_P - self.p_bar)
-                     + max(0.0, J_B - self.b_bar))
+        viol_D = 0.0 if "D" in self.dropped_constraints else max(0.0, J_D - self.d_bar)
+        viol_P = 0.0 if "P" in self.dropped_constraints else max(0.0, J_P - self.p_bar)
+        viol_B = 0.0 if "B" in self.dropped_constraints else max(0.0, J_B - self.b_bar)
+        violation = viol_D + viol_P + viol_B
         feasible = violation <= self.feasibility_tol
 
         for name, val in [

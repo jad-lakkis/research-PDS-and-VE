@@ -91,3 +91,33 @@ def dual_ascent_step(mu: float, avg_cost: float, budget: float, eta: float) -> f
     when it's satisfied.
     """
     return max(0.0, mu + eta * (avg_cost - budget))
+
+
+def parse_dropped_constraints(spec: str) -> frozenset:
+    """Parse --drop-constraints ("", "P", "P,B", ...) into a frozenset of
+    single-letter codes from {"D","P","B"}. A dropped constraint is a
+    GENUINE removal, not a loosened budget: its multiplier is pinned at 0
+    for the whole run (LagrangianRewardWrapper's mu_*_init below, plus
+    LagrangianMultiplierCallback/HeldOutTraceEvalCallback in train_ppo.py/
+    streaming_rl/eval.py skipping it), so it contributes exactly 0 to the
+    reward and is excluded from the feasibility/violation check - the
+    agent gets zero signal about it in either direction, not just a loose
+    one. Kept here (not inline in each entrypoint) so train_ppo.py and
+    train_ppo_pds.py can't drift into interpreting the flag differently.
+    """
+    if not spec:
+        return frozenset()
+    codes = frozenset(c.strip().upper() for c in spec.split(",") if c.strip())
+    assert codes <= {"D", "P", "B"}, f"--drop-constraints must be from {{D,P,B}}, got {spec!r}"
+    return codes
+
+
+def mu_init_kwargs(dropped_constraints: frozenset) -> dict:
+    """mu_*_init overrides for LagrangianRewardWrapper - 0.0 (and pinned
+    there, never updated) for any dropped constraint, config default
+    otherwise."""
+    return {
+        "mu_D_init": 0.0 if "D" in dropped_constraints else config.MU_D_INIT,
+        "mu_P_init": 0.0 if "P" in dropped_constraints else config.MU_P_INIT,
+        "mu_B_init": 0.0 if "B" in dropped_constraints else config.MU_B_INIT,
+    }

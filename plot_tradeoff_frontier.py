@@ -31,7 +31,7 @@ CONVERGED_WINDOW = 200
 # entity (method), never rank; categorical slots 1/2/3 (blue/orange/aqua)
 # are the ones validated all-pairs for a scatter form.
 SURFACE, INK, INK2, MUTED, GRID, AXIS = "#fcfcfb", "#0b0b0b", "#52514e", "#898781", "#e1e0d9", "#c3c2b7"
-METHOD_COLOR = {"PPO": "#2a78d6", "PPO+PDS": "#eb6834", "PPO+PDS (clip100)": "#1baf7a"}
+METHOD_COLOR = {"PPO": "#2a78d6", "PPO+PDS": "#eb6834"}
 
 plt.rcParams.update({
     "font.family": ["Segoe UI", "DejaVu Sans"], "font.size": 10,
@@ -65,11 +65,10 @@ def converged_point(df, d_bar, p_bar, b_bar):
 
 
 # Each entry: label shown on the plot, (method for color), pattern, budgets.
-# Baseline A (4 budgets) vs clean Run D (ent_coef=0, PDS-GAE) - clean D is
+# Baseline A (4 budgets) vs clean Run D (ent_coef=0, PDS-GAE). Clean D is
 # still training as of this pull, so its point is a snapshot, not a
-# final converged value; re-run as it progresses. clip100 variant kept
-# separate (own label) rather than averaged in with clean D, since
-# whether clipping helps is still an open question - see decision_log.md #26.
+# final converged value; re-run as it progresses. clip100 dropped per
+# explicit decision - not part of the official comparison.
 ARMS = [
     ("PPO", "0.3/6.5/8",  "runpod_results/dbar_0.3_pbar_6.5_bbar_8.0_seed0/block_v*/progress.csv", (0.3, 6.5, 8.0)),
     ("PPO", "0.12/4/7.4", "runpod_results_summary/02_most_important_runs/dbar_0.12_pbar_4_bbar_7.4_seed0/block_v*/progress.csv", (0.12, 4.0, 7.4)),
@@ -79,7 +78,6 @@ ARMS = [
     ("PPO+PDS", "0.12/4/7.4", "run_D_clean_results/run_D_clean_dbar_0.12_pbar_4_bbar_7.4_seed0/progress.csv", (0.12, 4.0, 7.4)),
     ("PPO+PDS", "0.12/4/8",   "run_D_clean_results/run_D_clean_dbar_0.12_pbar_4_bbar_8.0_seed0/progress.csv", (0.12, 4.0, 8.0)),
     ("PPO+PDS", "0.1/6.5/8",  "run_D_clean_results/run_D_clean_dbar_0.1_pbar_6.5_bbar_8.0_seed0/progress.csv", (0.1, 6.5, 8.0)),
-    ("PPO+PDS (clip100)", "0.12/4/7.4", "run_D_clean_results/run_D_clip100_dbar_0.12_pbar_4_bbar_7.4_seed0/progress.csv", (0.12, 4.0, 7.4)),
 ]
 
 PAIRS = [("J_D", "J_P", r"$J_D$ (stall)", r"$J_P$ (power)"), ("J_D", "J_B", r"$J_D$ (stall)", r"$J_B$ (tiles)"),

@@ -25,7 +25,7 @@ import pandas as pd
 CONVERGED_WINDOW = 200
 
 SURFACE, INK, INK2, MUTED, GRID, AXIS = "#fcfcfb", "#0b0b0b", "#52514e", "#898781", "#e1e0d9", "#c3c2b7"
-METHOD_COLOR = {"PPO": "#2a78d6", "PPO+PDS": "#eb6834", "PPO+PDS (clip100)": "#1baf7a"}
+METHOD_COLOR = {"PPO": "#2a78d6", "PPO+PDS": "#eb6834"}
 
 plt.rcParams.update({
     "font.family": ["Segoe UI", "DejaVu Sans"], "font.size": 10,
@@ -58,7 +58,6 @@ ARMS = [
     ("PPO+PDS", "0.12/4/7.4", "run_D_clean_results/run_D_clean_dbar_0.12_pbar_4_bbar_7.4_seed0/progress.csv"),
     ("PPO+PDS", "0.12/4/8",   "run_D_clean_results/run_D_clean_dbar_0.12_pbar_4_bbar_8.0_seed0/progress.csv"),
     ("PPO+PDS", "0.1/6.5/8",  "run_D_clean_results/run_D_clean_dbar_0.1_pbar_6.5_bbar_8.0_seed0/progress.csv"),
-    ("PPO+PDS (clip100)", "0.12/4/7.4", "run_D_clean_results/run_D_clip100_dbar_0.12_pbar_4_bbar_7.4_seed0/progress.csv"),
 ]
 
 # (progress.csv column, display label, higher-is-better)

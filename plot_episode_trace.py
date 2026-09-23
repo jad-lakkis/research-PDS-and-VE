@@ -39,7 +39,7 @@ import config
 from streaming_rl.environment import TileStreamingEnv
 
 SURFACE, INK, INK2, MUTED, GRID, AXIS = "#fcfcfb", "#0b0b0b", "#52514e", "#898781", "#e1e0d9", "#c3c2b7"
-METHOD_COLOR = {"PPO": "#2a78d6", "PPO+PDS": "#eb6834", "PPO+PDS (clip100)": "#1baf7a"}
+METHOD_COLOR = {"PPO": "#2a78d6", "PPO+PDS": "#eb6834"}
 STALL_COLOR = "#e34948"
 
 plt.rcParams.update({
@@ -50,13 +50,27 @@ plt.rcParams.update({
     "axes.grid": True, "axes.axisbelow": True,
 })
 
-# (label, model_dir, budget triple for that checkpoint's own trained
-# constraints - only used in the printed summary, not needed for
-# inference). Same held-out trace/budget (0.12/4/7.4) for both, so
-# behavior differences reflect the algorithm, not a different problem.
-RUNS = [
-    ("PPO", "runpod_results/dbar_0.12_pbar_4_bbar_7.4_seed0/block_v7"),
-    ("PPO+PDS", "run_D_clean_results/run_D_clean_dbar_0.12_pbar_4_bbar_7.4_seed0/best"),
+# One trace per budget arm - (budget label, out subdir, PPO model_dir,
+# PPO+PDS model_dir). Both methods use the SAME held-out trace/budget
+# per entry, so behavior differences reflect the algorithm, not a
+# different problem. clip100 dropped, not part of the official
+# comparison. PPO checkpoints below are each arm's LATEST block that
+# still has a saved model.zip (some final blocks save progress.csv but
+# not a fresh checkpoint) - see conversation history for how each was
+# picked.
+BUDGET_ARMS = [
+    ("0.3_6.5_8.0",
+     "runpod_results/dbar_0.3_pbar_6.5_bbar_8.0_seed0/block_v10",
+     "run_D_clean_results/run_D_clean_dbar_0.3_pbar_6.5_bbar_8.0_seed0/best"),
+    ("0.12_4_7.4",
+     "runpod_results/dbar_0.12_pbar_4_bbar_7.4_seed0/block_v7",
+     "run_D_clean_results/run_D_clean_dbar_0.12_pbar_4_bbar_7.4_seed0/best"),
+    ("0.12_4_8.0",
+     "runpod_results_v2/v3/dbar_0.12_pbar_4_bbar_8.0_seed0/block_v9",
+     "run_D_clean_results/run_D_clean_dbar_0.12_pbar_4_bbar_8.0_seed0/best"),
+    ("0.1_6.5_8.0",
+     "runpod_results/dbar_0.1_pbar_6.5_bbar_8.0_seed0/block_v6",
+     "run_D_clean_results/run_D_clean_dbar_0.1_pbar_6.5_bbar_8.0_seed0/best"),
 ]
 
 
@@ -104,12 +118,13 @@ def collect_trace(model_dir: str, n_episodes: int, trace_idx_pos: int):
     return rows, trace_position
 
 
-def generate(out_dir: str, n_episodes: int = 3, trace_idx_pos: int = 0):
+def generate(runs: list, out_dir: str, n_episodes: int = 3, trace_idx_pos: int = 0):
+    """runs: list of (label, model_dir), e.g. [("PPO", dir1), ("PPO+PDS", dir2)]."""
     os.makedirs(out_dir, exist_ok=True)
 
     traces = {}
     trace_position = None
-    for label, model_dir in RUNS:
+    for label, model_dir in runs:
         rows, trace_position = collect_trace(model_dir, n_episodes, trace_idx_pos)
         traces[label] = rows
         stall_n = sum(1 for r in rows if r["D_t"] > 0)
@@ -137,7 +152,7 @@ def generate(out_dir: str, n_episodes: int = 3, trace_idx_pos: int = 0):
         axes[1].plot(x, tiles, color=color, lw=1.4, label=label, alpha=0.9)
         if stall_x:
             axes[1].scatter(stall_x, [tiles[i] for i in stall_x], color=STALL_COLOR, s=32, zorder=5,
-                            marker="x" if label != RUNS[0][0] else "o")
+                            marker="x" if label != runs[0][0] else "o")
         axes[2].plot(x, power, color=color, lw=1.4, label=label, alpha=0.9)
 
     # Z is a DATA buffer (bits), not a time buffer - Z_next = Z + T0*R_t -
@@ -163,7 +178,12 @@ def generate(out_dir: str, n_episodes: int = 3, trace_idx_pos: int = 0):
 
 
 if __name__ == "__main__":
-    out_dir = sys.argv[1] if len(sys.argv) > 1 else "graphs_trace"
+    # <base_out_dir>/<budget>/episode_trace.png per arm in BUDGET_ARMS,
+    # so each run's trace sits alongside that run's overlay panels.
+    base_out_dir = sys.argv[1] if len(sys.argv) > 1 else "graphs_trace"
     n_episodes = int(sys.argv[2]) if len(sys.argv) > 2 else 3
     trace_idx_pos = int(sys.argv[3]) if len(sys.argv) > 3 else 0
-    generate(out_dir, n_episodes, trace_idx_pos)
+    for budget_label, ppo_dir, pds_dir in BUDGET_ARMS:
+        print(f"\n=== {budget_label} ===")
+        generate([("PPO", ppo_dir), ("PPO+PDS", pds_dir)],
+                 os.path.join(base_out_dir, budget_label), n_episodes, trace_idx_pos)

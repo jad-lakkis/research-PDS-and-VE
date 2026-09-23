@@ -30,6 +30,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 import config
 from streaming_rl import data_loader
 from streaming_rl.eval import HeldOutTraceEvalCallback
+from streaming_rl.lagrangian import parse_dropped_constraints
 from streaming_rl.pds_ppo import PPOWithPDS
 from train_ppo import (
     LagrangianMultiplierCallback,
@@ -76,6 +77,12 @@ def parse_args():
     p.add_argument("--clip-range-vf", type=float, default=None,
                     help="value-function clipping (raw units, depends on reward scale - see SB3 docs); "
                          "None (default) = off, matching every run so far")
+    # Genuine removal of a constraint from the Lagrangian, not a loosened
+    # budget - see streaming_rl.lagrangian.parse_dropped_constraints and
+    # train_ppo.py's own --drop-constraints for exactly what this does.
+    p.add_argument("--drop-constraints", type=str, default="",
+                    help="comma-separated subset of D,P,B to remove entirely from the "
+                         "reward and feasibility check, e.g. 'P' or 'P,B' (default: none dropped)")
     p.add_argument("--eval-freq-rollouts", type=int, default=1,
                     help="run held-out-trace evaluation every N rollouts")
     p.add_argument("--log-dir", type=str, default="runs/ppo_pds_run")
@@ -88,6 +95,9 @@ def parse_args():
 
 def main():
     args = parse_args()
+    dropped_constraints = parse_dropped_constraints(args.drop_constraints)
+    if dropped_constraints:
+        print(f"Dropping constraints entirely (not just loosening): {sorted(dropped_constraints)}")
 
     d_bar = args.d_bar if args.d_bar is not None else config.D_BAR
     p_bar = args.p_bar if args.p_bar is not None else config.P_BAR
@@ -104,7 +114,7 @@ def main():
     train_indices = [i for i in range(n_traces) if i not in eval_indices]
 
     train_venv = DummyVecEnv([
-        lambda: build_env(True, train_indices, bundle) for _ in range(args.n_envs)
+        lambda: build_env(True, train_indices, bundle, dropped_constraints) for _ in range(args.n_envs)
     ])
 
     if args.resume_from is not None:
@@ -130,12 +140,14 @@ def main():
     callbacks = [
         PhysicalMetricsCallback(),
         TileEnhancementTrackerCallback(log_dir=args.log_dir),
-        LagrangianMultiplierCallback(d_bar=d_bar, p_bar=p_bar, b_bar=b_bar, eta=config.MU_LEARNING_RATE),
+        LagrangianMultiplierCallback(d_bar=d_bar, p_bar=p_bar, b_bar=b_bar, eta=config.MU_LEARNING_RATE,
+                                      dropped_constraints=dropped_constraints),
         HeldOutTraceEvalCallback(
             d_bar=d_bar, p_bar=p_bar, b_bar=b_bar,
             best_model_save_path=os.path.join(args.log_dir, "best"),
             eval_every_n_rollouts=args.eval_freq_rollouts,
             log_dir=args.log_dir,
+            dropped_constraints=dropped_constraints,
             verbose=1,
         ),
     ]
