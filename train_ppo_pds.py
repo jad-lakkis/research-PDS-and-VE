@@ -53,6 +53,16 @@ def parse_args():
                          "entropy coefficient (stock PPO's own ent_coef*entropy_loss term, previously "
                          "always 0.0 here); only meaningful on a fresh start, not --resume-from, since "
                          "a resumed run keeps its own already-baked-in value")
+    # PDS-vs-baseline ablation (Run D): chains the PDS residual through the
+    # same backward GAE recursion as baseline PPO instead of stopping at one
+    # step (see PDSRolloutBuffer.compute_pds_returns_and_advantage). 0 =
+    # the original one-step PDS advantage (Run C, matches every prior PDS
+    # run in runpod_pds_results/); 0.95 (default here, matching train_ppo.py
+    # and SB3's own default) = Run D. Only meaningful on a fresh start, not
+    # --resume-from - baked into the saved model's own hyperparameters.
+    p.add_argument("--gae-lambda", type=float, default=0.95,
+                    help="GAE lambda for the PDS-residual advantage recursion (0 = original one-step "
+                         "PDS advantage / Run C, 0.95 = PDS-GAE / Run D matching baseline PPO)")
     p.add_argument("--eval-freq-rollouts", type=int, default=1,
                     help="run held-out-trace evaluation every N rollouts")
     p.add_argument("--log-dir", type=str, default="runs/ppo_pds_run")
@@ -96,9 +106,10 @@ def main():
         train_venv = VecNormalize(train_venv, training=True, norm_obs=True, norm_reward=False,
                                    gamma=config.PPO_GAMMA)
         model = PPOWithPDS(env=train_venv, n_steps=args.n_steps, gamma=config.PPO_GAMMA,
-                            ent_coef=ent_coef, seed=args.seed, verbose=1, device=args.device)
+                            gae_lambda=args.gae_lambda, ent_coef=ent_coef, seed=args.seed,
+                            verbose=1, device=args.device)
         print(f"Fresh start: d_bar={d_bar} p_bar={p_bar} b_bar={b_bar} ent_coef={ent_coef} "
-              f"pds_critic_architecture={config.PDS_CRITIC_ARCHITECTURE}")
+              f"gae_lambda={args.gae_lambda} pds_critic_architecture={config.PDS_CRITIC_ARCHITECTURE}")
     model.set_logger(sb3_configure(args.log_dir, ["stdout", "csv"]))
 
     callbacks = [

@@ -1,13 +1,18 @@
 """
-pds_ppo.py - PPOWithPDS: PPO with the ordinary single-critic advantage
-(GAE) replaced by the one-step PDS advantage, and a second, separate PDS
-critic Vtilde_psi trained alongside the actor/ordinary critic (PDS design
-plan, Sections 4/6/8).
+pds_ppo.py - PPOWithPDS: PPO with the ordinary GAE residual replaced by
+the PDS residual (delta_t^PDS = r_known^t + Vtilde_psi(omega~^t) -
+V_phi(omega^t)), chained through the same backward GAE(lambda) recursion
+as baseline PPO ("PDS-GAE" - see PDSRolloutBuffer.compute_pds_returns_and_advantage),
+plus a second, separate PDS critic Vtilde_psi trained alongside the
+actor/ordinary critic (PDS design plan, Sections 4/6/8). gae_lambda is
+inherited unchanged from stock PPO's own constructor kwarg/self.gae_lambda -
+0 reproduces the original one-step PDS advantage, 0.95 matches baseline
+PPO's horizon.
 
 Overrides collect_rollouts() (Phase A: also builds omega~^t and the
 known/random reward split every step, using the LIVE mu_D/mu_P/mu_B) and
-train() (Phase C: uses A^t_PDS instead of GAE, adds the PDS critic's own
-MSE loss term). Phase D (multiplier updates) is untouched -
+train() (Phase C: uses A^t_PDS-GAE instead of ordinary GAE, adds the PDS
+critic's own MSE loss term). Phase D (multiplier updates) is untouched -
 train_ppo.py's LagrangianMultiplierCallback works identically here,
 hooked to _on_rollout_end the same way, since PPOWithPDS still calls
 callback.on_rollout_end() at exactly the same point stock
@@ -157,7 +162,9 @@ class PPOWithPDS(PPO):
         with th.no_grad():
             last_values = self.policy.predict_values(obs_as_tensor(new_obs, self.device))
 
-        rollout_buffer.compute_pds_returns_and_advantage(self.policy, last_values=last_values)
+        rollout_buffer.compute_pds_returns_and_advantage(
+            self.policy, last_values=last_values, gae_lambda=self.gae_lambda,
+        )
 
         callback.update_locals(locals())
         callback.on_rollout_end()

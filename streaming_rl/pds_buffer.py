@@ -5,11 +5,17 @@ omega~^t, the known/random reward split, and per-step
 terminated/truncated/true_next_obs bookkeeping - PDS design plan,
 Section 8/Phase B).
 
-compute_pds_returns_and_advantage() replaces GAE with the one-step PDS
-advantage/targets (Section 4/6 of the plan) - a genuinely different
-formula, not a variant of GAE, so this is a separate method, not an
-override of the base class's compute_returns_and_advantage() (which is
-simply never called anywhere in the PPO+PDS path).
+compute_pds_returns_and_advantage() computes the PDS one-step residual
+delta_t^PDS = r_known^t + Vtilde_psi(omega~^t) - V_phi(omega^t), then
+chains it through the same backward GAE(lambda) recursion Schulman et
+al.'s GAE uses on the ordinary TD residual - "PDS-GAE". gae_lambda=0
+collapses this to exactly the original one-step PDS advantage (A_t =
+delta_t^PDS, no temporal chaining); gae_lambda=0.95 matches baseline
+PPO's own horizon (the Run-D ablation: same GAE parameters as baseline,
+differing only in whether the one-step residual is estimated
+conventionally or through the PDS decomposition). Not an override of
+the base class's compute_returns_and_advantage() (never called anywhere
+in the PPO+PDS path) since the residual itself is PDS-specific.
 """
 
 from collections.abc import Generator
@@ -76,7 +82,7 @@ class PDSRolloutBuffer(RolloutBuffer):
         self.truncateds[pos] = np.array(truncated)
         super().add(obs, action, reward, episode_start, value, log_prob)
 
-    def compute_pds_returns_and_advantage(self, policy, last_values: th.Tensor) -> None:
+    def compute_pds_returns_and_advantage(self, policy, last_values: th.Tensor, gae_lambda: float) -> None:
         """Phase B of the PPO+PDS pseudocode. Must be called once, after the
         rollout is fully collected (self.full is True) and BEFORE any policy
         update this rollout - every target below is computed with the
@@ -84,11 +90,21 @@ class PDSRolloutBuffer(RolloutBuffer):
         later recomputes fresh, grad-carrying forward passes for the actual
         loss terms.
 
+        gae_lambda has no default - callers must choose explicitly (0 for
+        the original one-step PDS advantage, 0.95 to match baseline PPO's
+        own GAE horizon).
+
         V_next^t = 0                              if terminated at t (true episode end - no bootstrap)
                  = V_phi(true_next_obs^t)          if truncated at t (bootstrap from the TRUE cutoff state,
                                                      not the next episode's freshly auto-reset observation)
                  = V_phi(omega^{t+1})               otherwise (the next stored step's own omega, or the
                                                      end-of-rollout bootstrap value on the buffer's last step)
+
+        This V_next/pds_returns machinery is for the PDS CRITIC's own
+        training target only (ytilde_t = r_random^t + gamma*V_next, left
+        exactly as before by the Run-D change) - it plays no part in the
+        actor's advantage, which is self-contained per step through
+        Vtilde_psi(omega~^t) and never needs to look at the next stored row.
         """
         assert self.full, "compute_pds_returns_and_advantage() must be called on a full buffer"
         last_values_np = last_values.clone().cpu().numpy().flatten()
@@ -119,9 +135,38 @@ class PDSRolloutBuffer(RolloutBuffer):
         v_next[truncated_mask] = v_true_next[truncated_mask]
         v_next[otherwise_mask] = v_next_otherwise[otherwise_mask]
 
-        self.pds_returns = self.random_rewards + self.gamma * v_next   # y~^t
-        self.ordinary_returns = self.known_rewards + v_pds             # y^t
-        self.advantages = self.ordinary_returns - self.values          # A^t_PDS = y^t - v_t
+        self.pds_returns = self.random_rewards + self.gamma * v_next   # y~^t - UNCHANGED by Run D
+
+        # delta_t^PDS = r_known^t + Vtilde_psi(omega~^t) - V_phi(omega^t):
+        # the PDS one-step residual, fully self-contained per t (unlike the
+        # ordinary TD residual, it never needs the next stored step's own
+        # value - Vtilde_psi(omega~^t) already stands in for it). This is
+        # Run C's entire advantage, and Run D's per-step building block.
+        delta_pds = self.known_rewards + v_pds - self.values
+
+        # Backward PDS-GAE recursion (Schulman et al.'s GAE applied to
+        # delta_pds instead of the ordinary TD residual):
+        #   A_t = delta_t^PDS + gamma*lambda*next_non_terminal*A_{t+1}
+        # next_non_terminal is 0 at any terminated OR truncated step -
+        # chaining across an episode boundary would mix an unrelated future
+        # episode's residuals into this one. At gae_lambda=0 this collapses
+        # to exactly A_t = delta_t^PDS (bit-identical to the old one-step
+        # formula, Run C); at gae_lambda=0.95 it matches baseline PPO's own
+        # GAE horizon (Run D).
+        next_non_terminal = otherwise_mask.astype(np.float32)
+        advantages = np.zeros_like(self.values)
+        last_gae_lam = 0
+        for step in reversed(range(self.buffer_size)):
+            last_gae_lam = delta_pds[step] + self.gamma * gae_lambda * next_non_terminal[step] * last_gae_lam
+            advantages[step] = last_gae_lam
+        self.advantages = advantages
+
+        # Ordinary critic target follows SB3's own returns=advantages+values
+        # convention, so the ordinary critic trains toward the same horizon
+        # as the actor. At gae_lambda=0 this is bit-identical to the old
+        # y^t = r_known^t + Vtilde_psi(omega~^t), since advantages+values
+        # reduces to delta_pds+values = known_rewards+v_pds exactly.
+        self.ordinary_returns = self.advantages + self.values          # R^t_PDS-GAE
 
     def get(self, batch_size: int | None = None) -> Generator[PDSRolloutBufferSamples, None, None]:
         assert self.full, ""

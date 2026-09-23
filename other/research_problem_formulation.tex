@@ -1,0 +1,826 @@
+\documentclass[10pt,conference,a4paper]{IEEEtran}
+
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{graphicx}
+\usepackage{microtype}
+\usepackage{newtxtext,newtxmath}
+\usepackage{float}
+\usepackage{balance}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\pagestyle{empty}
+
+% ---------------------------------------------------------
+% Compact formatting
+% ---------------------------------------------------------
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{1pt}
+
+\setlength{\abovedisplayskip}{3pt}
+\setlength{\belowdisplayskip}{3pt}
+\setlength{\abovedisplayshortskip}{2pt}
+\setlength{\belowdisplayshortskip}{2pt}
+\setlength{\jot}{1.5pt}
+
+\setlength{\floatsep}{4pt}
+\setlength{\textfloatsep}{4pt}
+\setlength{\intextsep}{4pt}
+\setlength{\abovecaptionskip}{3pt}
+\setlength{\belowcaptionskip}{1pt}
+
+\algrenewcommand\algorithmicindent{1.4em}
+
+% ---------------------------------------------------------
+% Commands
+% ---------------------------------------------------------
+\newcommand{\E}{\mathbb{E}}
+
+\newcommand{\head}[1]{%
+    \vspace{2pt}
+    \noindent
+    \textbf{#1}
+    \hspace{2pt}
+}
+
+\begin{document}
+
+% ---------------------------------------------------------
+% Title
+% ---------------------------------------------------------
+\title{
+Research Problem Formulation
+}
+
+\author{
+Jad Al Lakkis
+}
+
+\maketitle
+\thispagestyle{empty}
+
+\vspace{-8pt}
+
+% =========================================================
+% PROBLEM
+% =========================================================
+
+\head{Problem and main idea.}
+A UAV with a $360^{\circ}$ camera cannot send to the user the
+live streamed video entirely in high quality due to limited wireless
+bandwidth, transmission power, and buffer constraints. So, we
+split the video into a base layer and an enhancement layer and,
+given a predicted viewport, select specific tiles to enhance using
+reinforcement learning. However, this can be expensive, so we use
+known system components after the action through post-decision
+states to accelerate learning. Then, since the actual viewport and
+next channel are statistically independent of an action given the state, virtual experience can be used to further
+accelerate learning.
+
+% =========================================================
+% SYSTEM FIGURE
+% =========================================================
+
+\begin{figure}[H]
+    \centering
+
+    \makebox[\columnwidth][c]{%
+        \includegraphics[
+            width=1.08\columnwidth
+        ]{system_model.png}
+    }
+
+    \vspace{-4pt}
+
+    \caption{
+    Proposed tile-selective aerial $360^{\circ}$ video streaming
+    system.
+    }
+
+    \label{fig:system}
+\end{figure}
+
+% =========================================================
+% TILE SELECTION AND ACTION
+% =========================================================
+
+\head{Tile selection and action.}
+Let the complete $360^{\circ}$ video frame be divided into the
+tile set
+
+\begin{equation}
+\mathcal{N}
+=
+\{1,\ldots,N\}.
+\end{equation}
+
+The predicted viewport tiles are sent as enhanced tiles. In
+addition, the agent selects any other tile from the complete
+panorama. The enhanced region is
+
+\begin{equation}
+\mathcal{E}^t(\mathbf{x}^t)
+=
+\left\{
+i\in\mathcal{N}:x_i^t=1
+\right\}.
+\end{equation}
+
+The action is
+
+\begin{equation}
+\alpha^t
+=
+(\mathbf{x}^t,P^t),
+\qquad
+\mathbf{x}^t
+=
+(x_1^t,\ldots,x_N^t),
+\end{equation}
+
+where $x_i^t=1$ if tile $i$ is enhanced and $x_i^t=0$
+otherwise. The predicted viewport tiles are assigned
+$x_i^t=1$, while the agent may additionally enhance tiles from
+the rest of the panorama. The UAV transmit power satisfies
+
+\begin{equation}
+0\leq P^t\leq P_{\max}.
+\end{equation}
+
+% =========================================================
+% FORCE CMDP TO TOP OF RIGHT COLUMN
+% =========================================================
+
+\newpage
+
+% =========================================================
+% CMDP
+% =========================================================
+
+\head{Constrained Markov decision process.}
+
+
+\begin{align}
+\max_{\pi}\quad
+&
+\E_{\pi}
+\left[
+\sum_{t=0}^{\infty}
+\lambda^t
+\bar Q_{\mathrm{viewport}}^t
+\right]
+\\[-1pt]
+\text{s.t.}\quad
+&
+\E_{\pi}
+\left[
+\sum_{t=0}^{\infty}
+\lambda^t
+\frac{D^t}{T_0}
+\right]
+\leq
+\bar D,
+\\[-1pt]
+&
+\E_{\pi}
+\left[
+\sum_{t=0}^{\infty}
+\lambda^t
+\frac{P^t}{P_{\max}}
+\right]
+\leq
+\bar P,
+\\[-1pt]
+&
+\E_{\pi}
+\left[
+\sum_{t=0}^{\infty}
+\lambda^t
+\frac{
+\sum_{i=1}^{N}x_i^t
+}{
+N
+}
+\right]
+\leq
+\bar B.
+\end{align}
+
+Here, $T_0$ is the duration of one time slot,
+$\bar Q_{\mathrm{viewport}}^t$ is the normalized viewport quality
+at time $t$, and $\bar D$, $\bar P$, and $\bar B$ are the stall,
+power, and number-of-tiles budgets, respectively.
+
+The penalty-based reward is
+
+\begin{equation}
+r^t
+=
+\beta_q\bar Q_{\mathrm{viewport}}^t
+-
+\beta_s\frac{D^t}{T_0}
+-
+\beta_p\frac{P^t}{P_{\max}}
+-
+\beta_b
+\frac{
+\sum_{i=1}^{N}x_i^t
+}{
+N
+}.
+\end{equation}
+
+It increases viewport quality while reducing stall time,
+transmit power, and unnecessary enhanced tiles.
+
+% =========================================================
+% PRE-DECISION STATE
+% =========================================================
+
+\head{Pre-decision state.}
+The pre-decision state is
+
+\begin{equation}
+\omega^t
+=
+\left(
+Z^t,
+\Delta_\theta^{t-1},
+\Delta_\phi^{t-1},
+h^t
+\right),
+\end{equation}
+
+where $Z^t$ is the playback-buffer level,
+$\Delta_\theta^{t-1}$ and $\Delta_\phi^{t-1}$ are the previous
+viewport-prediction errors, and $h^t$ is the current
+UAV-to-base-station channel gain. The predicted viewport is given seperately using methods like predicting the last viewport where the user was looking , or other possible methods.
+
+% =========================================================
+% QOE
+% =========================================================
+
+\head{QoE.}
+We define the Quality of Experience as follows, ($V_{\mathrm{actu}}^t$ is the actual viewport),
+\begin{equation}
+C_{\mathrm{cov}}^t
+=
+\frac{
+\left|
+V_{\mathrm{actu}}^t
+\cap
+\mathcal{E}^t(\mathbf{x}^t)
+\right|
+}{
+\left|
+V_{\mathrm{actu}}^t
+\right|
+},
+\qquad
+\bar Q_{\mathrm{viewport}}^t
+=
+C_{\mathrm{cov}}^t.
+\end{equation}
+
+% =========================================================
+% KNOWN QUANTITIES AFTER THE ACTION
+% =========================================================
+
+\head{Known quantities after the action.}
+Once the action $\alpha^t$ is selected, the enhanced region and
+total transmitted data size are known:
+
+\begin{equation}
+A^t
+=
+A_{\mathrm{base}}
++
+\sum_{i\in\mathcal{E}^t(\mathbf{x}^t)}
+A_{i,\mathrm{enh}}^t.
+\end{equation}
+
+The transmission rate is
+
+\begin{equation}
+R^t
+=
+W\log_2
+\left(
+1+
+\frac{P^th^t}{WN_0}
+\right).
+\end{equation}
+
+The stall time is
+
+\begin{equation}
+D^t
+=
+\begin{cases}
+0,
+&
+Z^t+T_0R^t\geq A^t,
+\\[1pt]
+T_0
+\left(
+1-
+\dfrac{Z^t+T_0R^t}{A^t}
+\right),
+&
+\text{otherwise}.
+\end{cases}
+\end{equation}
+
+The deterministic buffer update is
+
+\begin{equation}
+\widetilde Z^{t+1}
+=
+\max
+\left\{
+Z^t+T_0R^t-A^t,
+0
+\right\}.
+\end{equation}
+
+Therefore, after the action, the following quantities are known:
+
+\[
+\mathcal{E}^t(\mathbf{x}^t),
+\quad
+A^t,
+\quad
+R^t,
+\quad
+D^t,
+\quad
+\widetilde Z^{t+1}.
+\]
+
+% =========================================================
+% KNOWN / RANDOM SPLIT
+% =========================================================
+
+\head{Known/random split and post-decision state.}
+The PDS separates the quantities known after the action from the
+quantities that are still random:
+
+\[
+\omega^t
+\xrightarrow{\alpha^t}
+\widetilde\omega^t
+\xrightarrow{
+V_{\mathrm{actu}}^t,\,
+h^{t+1}
+}
+\omega^{t+1}.
+\]
+
+The proposed post-decision state is
+
+\begin{equation}
+\widetilde\omega^t
+=
+\left(
+\widetilde Z^{t+1},
+\Delta_\theta^{t-1},
+\Delta_\phi^{t-1},
+h^t,
+\mathcal{E}^t(\mathbf{x}^t)
+\right).
+\end{equation}
+
+At the post-decision state, the quantities that remain unknown are
+
+\[
+V_{\mathrm{actu}}^t,
+\quad
+\Delta_\theta^t,
+\quad
+\Delta_\phi^t,
+\quad
+\bar Q_{\mathrm{viewport}}^t,
+\quad
+h^{t+1}.
+\]
+
+After observing $V_{\mathrm{actu}}^t$ and $h^{t+1}$, the next
+state is
+
+\begin{equation}
+\omega^{t+1}
+=
+\left(
+\widetilde Z^{t+1},
+\Delta_\theta^t,
+\Delta_\phi^t,
+h^{t+1}
+\right).
+\end{equation}
+
+% =========================================================
+% REWARD SPLIT
+% =========================================================
+
+The reward is then split into a component known immediately after the
+action and a component that depends on the random outcome:
+
+\begin{align}
+r^t
+&=
+r_{\mathrm{known}}^t
++
+r_{\mathrm{random}}^t,
+\\
+r_{\mathrm{known}}^t
+&=
+-\beta_s\frac{D^t}{T_0}
+-\beta_p\frac{P^t}{P_{\max}}
+-\beta_b
+\frac{
+\sum_{i=1}^{N}x_i^t
+}{
+N
+},
+\\
+r_{\mathrm{random}}^t
+&=
+\beta_q
+\bar Q_{\mathrm{viewport}}^t.
+\end{align}
+
+% =========================================================
+% ROLLOUT / EPISODE STRUCTURE  (NEW, simplified)
+% =========================================================
+
+\head{Rollout and episode structure.}
+Each episode lasts 36 time steps. A rollout consists of 48
+episodes, i.e.\ 1728 environment steps.
+
+% =========================================================
+% PSNR  (NEW, with provenance note)
+% =========================================================
+
+\head{Viewport PSNR.}
+This is the standard PSNR definition (not specific to any of the
+references cited below), applied here to this project's own
+per-tile, per-quality-level luma MSE data and pooled with the
+same viewport-overlap weights already used for
+$C_{\mathrm{cov}}^t$. Let $w_i^t\in[0,1]$ denote the fraction of
+tile $i$'s area covered by the actual viewport at time $t$, and
+$\mathrm{MSE}_i^t$ tile $i$'s luma mean-squared error at whichever
+quality level it was actually sent (base or enhanced). The pooled
+viewport MSE and PSNR are
+
+\begin{equation}
+\overline{\mathrm{MSE}}^t
+=
+\frac{\sum_i w_i^t\,\mathrm{MSE}_i^t}{\sum_i w_i^t},
+\qquad
+\mathrm{PSNR}^t
+=
+10\log_{10}
+\!\left(
+\frac{255^2}{\overline{\mathrm{MSE}}^t}
+\right).
+\end{equation}
+
+% =========================================================
+% LAGRANGIAN MULTIPLIER UPDATE  (NEW, no more L subscript)
+% =========================================================
+\head{Lagrangian multiplier update.}
+The constraints in the CMDP are expected values, so a Lagrangian
+relaxation replaces the fixed weights $\beta_s,\beta_p,\beta_b$ in
+$r^t$ with adaptive multipliers $\mu_D,\mu_P,\mu_B\geq0$; from here
+on, $r^t$, $r_{\mathrm{known}}^t$, and $r_{\mathrm{random}}^t$ use
+these multipliers in place of the fixed weights:
+
+\begin{equation}
+r^t
+=
+\beta_q\bar Q_{\mathrm{viewport}}^t
+-\mu_Dc_D^t
+-\mu_Pc_P^t
+-\mu_Bc_B^t,
+\end{equation}
+
+with $c_D^t=D^t/T_0$, $c_P^t=P^t/P_{\max}$, and
+$c_B^t=\sum_i x_i^t/N$ (the same three terms as in the CMDP
+constraints). For an episode $e$, the discounted constraint
+returns are
+
+\begin{equation}
+J_j^{(e)}
+=
+\sum_{t=0}^{35}
+\lambda^t c_j^{t,(e)},
+\qquad
+j\in\{D,P,B\}.
+\end{equation}
+
+At the end of each rollout, these returns are averaged over its 48
+completed episodes:
+
+\begin{equation}
+\overline J_j^{\mathrm{rollout}}
+=
+\frac{1}{48}
+\sum_{e=1}^{48}J_j^{(e)}.
+\end{equation}
+
+This sample average provides a Monte Carlo estimate of the expected
+discounted constraint return under the current policy. Each
+multiplier is then updated once per rollout using the projected
+dual-ascent step
+
+\begin{equation}
+\mu_j
+\leftarrow
+\left[
+\mu_j
++
+\eta_\mu
+\left(
+\overline J_j^{\mathrm{rollout}}
+-
+\bar b_j
+\right)
+\right]_+,
+\qquad
+j\in\{D,P,B\},
+\end{equation}
+
+where $\eta_\mu$ is the multiplier learning rate and
+$\bar b_D=\bar D$, $\bar b_P=\bar P$, $\bar b_B=\bar B$.
+
+% =========================================================
+% CRITICS  (NEW, no more L subscript)
+% =========================================================
+
+\head{Pre-decision and post-decision critics.}
+Following the two-critic post-decision-state design of the EHS
+paper (adapted here from its soft-actor-critic setting to a
+policy-gradient/PPO setting), a critic $V(\omega^t)$ estimates
+the pre-decision state and a second critic
+$\widetilde V(\widetilde\omega^t)$ estimates the post-decision
+state. Since $r_{\mathrm{known}}^t$ is computed analytically
+instead of learned from experience, this split leaves each
+critic only the part of the value it cannot already compute --
+which is what accelerates learning, versus one critic having to
+learn the fully blended known-plus-random value from scratch.
+Using the known/random split of $r^t$ with the adaptive
+multipliers (above):
+
+\begin{equation}
+r_{\mathrm{known}}^t
+=
+-\mu_Dc_D^t-\mu_Pc_P^t-\mu_Bc_B^t,
+\qquad
+r_{\mathrm{random}}^t
+=
+\beta_qC_{\mathrm{cov}}^t.
+\end{equation}
+
+The two critics are trained toward the targets
+
+\begin{equation}
+\widetilde y^t
+=
+r_{\mathrm{random}}^t+\lambda V(\omega^{t+1}),
+\qquad
+y^t
+=
+r_{\mathrm{known}}^t+\widetilde V(\widetilde\omega^t).
+\end{equation}
+
+% =========================================================
+% ADVANTAGE  (NEW, no more L subscript)
+% =========================================================
+
+\head{Advantage.}
+Whether the action was good is measured by the one-step
+post-decision-state advantage (EHS paper),
+
+\begin{equation}
+A^t
+=
+y^t-V(\omega^t)
+=
+r_{\mathrm{known}}^t+\widetilde V(\widetilde\omega^t)-V(\omega^t).
+\end{equation}
+
+% =========================================================
+% ACTOR LOSS / ENTROPY  (NEW, terms labeled)
+% =========================================================
+
+\head{Actor loss and entropy regularization.}
+The actor is updated with PPO's clipped surrogate objective using
+$A^t$ in place of the usual advantage estimate, together with an
+entropy regularizer that keeps the policy from collapsing onto a
+narrow behavior before the constraints are satisfied:
+
+\begin{equation}
+\mathcal L_\theta
+=
+\underbrace{
+-\min\!\big(
+\rho^tA^t,\,
+\mathrm{clip}(\rho^t,1{-}\epsilon,1{+}\epsilon)A^t
+\big)
+}_{\text{PPO's own clipped surrogate}}
+\;
+\underbrace{
+-\,\alpha H\big(\pi_\theta(\cdot\,|\,\omega^t)\big)
+}_{\text{entropy term, EHS paper}},
+\end{equation}
+
+with $\rho^t=\pi_\theta(\alpha^t|\omega^t)/
+\pi_{\theta,\mathrm{old}}(\alpha^t|\omega^t)$ and entropy
+coefficient $\alpha>0$. The advantage $A^t$ used inside the
+clipped surrogate is itself adapted from the EHS paper (previous
+section), even though the clipping mechanism around it is PPO's
+own.
+
+% =========================================================
+% ALGORITHM 1: PDS  (NEW, no more L subscript)
+% =========================================================
+
+\begin{algorithm}[H]
+\caption{PPO + Post-Decision State Algorithm}
+\label{alg:pds}
+
+\small
+
+\begin{algorithmic}[1]
+\setlength{\itemsep}{1pt}
+
+\State Initialize actor $\pi_\theta$, critics $V,\widetilde V$,
+multipliers $\mu_D,\mu_P,\mu_B$
+
+\Statex \vspace{2pt}
+
+\For{rollout $=1,2,\ldots$}
+
+    \For{$t=0,\ldots,n_{\mathrm{steps}}-1$}
+
+        \State Observe
+        $\omega^t=(Z^t,\Delta_\theta^{t-1},
+        \Delta_\phi^{t-1},h^t)$
+
+        \State Predict viewport $\widehat V^t$
+
+        \State Sample $\alpha^t\sim\pi_\theta(\cdot\,|\,\omega^t)$
+
+        \State Execute $\alpha^t$ and form the post-decision
+        state $\widetilde\omega^t$
+
+        \State Observe $V_{\mathrm{actu}}^t,h^{t+1}$; compute
+        $r^t$ and $\omega^{t+1}$
+
+        \State Split $r^t$ into $r_{\mathrm{known}}^t,
+        r_{\mathrm{random}}^t$ using $\mu_D,\mu_P,\mu_B$
+
+        \State Store $\big(\omega^t,\alpha^t,\widetilde\omega^t,
+        r_{\mathrm{known}}^t,r_{\mathrm{random}}^t\big)$
+
+    \EndFor
+
+    \Statex \vspace{2pt}
+
+    \For{each stored step $t$}
+
+        \State Compute targets $\widetilde y^t,y^t$ and
+        advantage $A^t$
+
+    \EndFor
+
+    \State Update $\pi_\theta,V,\widetilde V$ using $A^t$ and
+    $\mathcal L_\theta$
+
+    \State Update $\mu_D,\mu_P,\mu_B$ once per rollout
+
+\EndFor
+
+\end{algorithmic}
+\end{algorithm}
+
+% =========================================================
+% VIRTUAL EXPERIENCE (moved to the end, later work)
+% =========================================================
+
+\balance
+
+\head{Virtual experience.}
+The actual viewport and next channel are assumed conditionally
+independent of a hypothetical action given the current state:
+
+Therefore, the same observed random outcome can be applied to
+multiple hypothetical post-decision states:
+
+\[
+\left\{
+\widetilde\omega^{t,(m)}
+\right\}_{m=1}^{M_v}
+\xrightarrow{
+\substack{
+V_{\mathrm{actu}}^t\\
+h^{t+1}
+}
+}
+\left\{
+\omega^{t+1,m}
+\right\}_{m=1}^{M_v}.
+\]
+
+Thus, one observed viewport and channel realization can generate
+multiple post-decision-state updates. In other words, since
+$V_{\mathrm{actu}}^t$ and $h^{t+1}$ do not depend on which
+hypothetical action was taken, the single pair we actually
+observe is reused, unchanged, to update $\widetilde V$ at every
+$\widetilde\omega^{t,(m)}$ in the batch, not only at the
+post-decision state of the action that was really executed.
+
+% =========================================================
+% ALGORITHM 2: PDS + VIRTUAL EXPERIENCE (moved, unchanged content)
+% =========================================================
+
+\begin{algorithm}[H]
+\caption{PDS + Virtual Experience Algorithm}
+\label{alg:pds-ve}
+
+\small
+
+\begin{algorithmic}[1]
+\setlength{\itemsep}{1pt}
+
+\State Initialize the PDS value function $\widetilde V$
+
+\State Choose VE batch size $B_{\mathrm{VE}}$ and VE update period $T$
+
+\Statex \vspace{2pt}
+
+\For{$t=0,1,2,\ldots$}
+
+    \State Observe
+    $\omega^t=(Z^t,\Delta_\theta^{t-1},
+    \Delta_\phi^{t-1},h^t)$
+
+    \State Predict viewport $\widehat V^t$
+
+    \State Select $\alpha^t=(\mathbf{x}^t,P^t)$ that maximizes
+    the known immediate reward plus the estimated
+    post-decision-state value.
+
+    \State Execute $\alpha^t$ and form the realized PDS
+    $\widetilde\omega^t$
+
+    \State Observe $V_{\mathrm{actu}}^t$ and $h^{t+1}$
+
+    \State Compute coverage, reward $r^t$, and next state
+    $\omega^{t+1}$
+
+    \Statex \vspace{2pt}
+
+    \If{$t\bmod T=0$}
+
+        \State Construct the virtual PDS batch
+
+        \Statex
+        \[
+        \mathcal{B}_{\mathrm{VE}}^t
+        =
+        \left\{
+        \widetilde\omega^{t,(1)},
+        \ldots,
+        \widetilde\omega^{t,(B_{\mathrm{VE}})}
+        \right\}
+        \]
+
+        \For{each
+        $\widetilde\omega^{t,(b)}
+        \in
+        \mathcal{B}_{\mathrm{VE}}^t$}
+
+            \State Reuse the observed $V_{\mathrm{actu}}^t$
+            and $h^{t+1}$
+
+            \State Compute virtual coverage, reward $r^{t,(b)}$,
+            and next state $\omega^{t+1,(b)}$
+
+            \State Update
+            $\widetilde V(\widetilde\omega^{t,(b)})$
+
+        \EndFor
+
+    \Else
+
+        \State Update only the realized PDS
+        $\widetilde V(\widetilde\omega^t)$
+
+    \EndIf
+
+\EndFor
+
+\end{algorithmic}
+\end{algorithm}
+
+\end{document}
