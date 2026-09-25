@@ -14,7 +14,7 @@ runpod_results_v2/
 runpod_results_summary/
 runpod_pds_results/
 ent_tests/
-PDS VS BASELINE/
+EXP1_D_VS_A/
 run_D_clean_results/
 baseline_A_key_metrics/
 *.zip
