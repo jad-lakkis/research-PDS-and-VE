@@ -1,0 +1,554 @@
+\documentclass[conference]{IEEEtran}
+
+\usepackage{graphicx}
+\usepackage{multirow}
+\usepackage{array}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{xcolor}
+\usepackage{colortbl}
+
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{bm}
+\usepackage{mathtools}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{booktabs}
+
+\usepackage{graphicx,color}
+\newcommand{\blue}[1]{{\color{blue}{#1}}}
+\newcommand{\red}[1]{{\color{red}{#1}}}
+\newcommand{\mbf}[1]{\mathbf{#1}}
+\newcommand{\abs}[1]{\left|#1\right|}
+\newcommand{\norm}[1]{\left\|{#1}\right\|}
+
+\newcommand{\EE}{\mathbb{E}}
+\newcommand{\RR}{\mathbb{R}}
+\DeclareMathOperator*{\argmin}{arg\,min}
+\DeclareMathOperator*{\argmax}{arg\,max}
+\newtheorem{remark}{Remark}
+
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+
+\begin{document}
+
+\title{Post-Decision-State Proximal Policy Optimization for Constrained UAV 360\textdegree{} Video Streaming: A PDS-GAE Extension and Empirical Characterization}
+
+\author{
+\IEEEauthorblockN{Jad Al Lakkis}
+\IEEEauthorblockA{% TODO: affiliation, advisor(s) as co-authors, dept./university
+\textit{[affiliation]} \\
+[email]}
+}
+
+\maketitle
+
+% =====================================================================
+\begin{abstract}
+We study tile-selective enhancement-layer streaming of 360\textdegree{} video from a UAV under
+joint stall, transmit-power, and tile-budget constraints, formulated as a constrained
+Markov decision process (CMDP) and solved with Lagrangian-relaxed proximal policy
+optimization (PPO). Building on this baseline, we introduce a post-decision-state (PDS)
+critic that separates the reward and next state into a component known immediately
+after the tile/power decision and a component that remains random until the next
+viewport and channel realization are observed. An initial one-step PDS advantage,
+adapted from prior soft-actor-critic-based PDS work, is shown empirically to truncate
+credit assignment and fail to reach reliable feasibility; we derive and evaluate a
+generalization, PDS-GAE, that chains the PDS residual through the same backward
+generalized-advantage-estimation recursion used by the baseline. Across two constraint
+budgets, multiple seeds, and matched-rollout comparisons, PDS-GAE reaches moderate
+constraint satisfaction $2$--$3.5\times$ faster than the PPO baseline in every seed
+tested, an effect we trace to a measurably lower-variance policy-gradient residual
+relative to a same-rollout ordinary-TD counterfactual. This early advantage does not,
+however, translate into uniformly higher final reliability: PDS-GAE exhibits a
+persistent, non-resolving feasibility oscillation, independently reproduced in both
+budgets over $4{,}000+$ training rollouts, which we characterize and partially
+diagnose. We further propose Virtual Experience (VE), a mechanism that reuses one
+observed random outcome across multiple hypothetical actions to generate additional
+training targets for the PDS critic at zero extra environment cost; we give its
+derivation, algorithm, and applicability argument, but do not yet report empirical
+results for it, leaving its evaluation to future work.
+\end{abstract}
+
+\begin{IEEEkeywords}
+constrained reinforcement learning, proximal policy optimization, post-decision state,
+360-degree video streaming, UAV communications, Lagrangian relaxation
+\end{IEEEkeywords}
+
+% =====================================================================
+\section{Introduction}
+
+Unmanned aerial vehicles (UAVs) equipped with $360^{\circ}$ cameras are an attractive
+platform for immersive live streaming, but the wireless downlink to a head-mounted
+display (HMD) is simultaneously bandwidth-, power-, and buffer-limited. A standard
+mitigation, used in~\cite{ref_mmsp25} % TODO: verify exact MMSP'25 citation key/venue
+and adopted as the base system here, is to encode the panorama as a low-resolution
+base layer plus a tile-partitioned enhancement layer, and to transmit only the
+enhancement-layer tiles that overlap the user's \emph{predicted} viewport, plus any
+additional tiles an agent chooses to send speculatively. This is naturally posed as a
+constrained Markov decision process (CMDP): maximize expected discounted viewport
+quality subject to per-step stall-time, transmit-power, and tile-count budgets.
+Lagrangian relaxation with dual-ascent multiplier updates converts this into an
+unconstrained reward that a standard policy-gradient method, here PPO, can optimize
+directly, as established in our base system~\cite{ref_mmsp25}.
+
+Every quantity needed to compute the stall time, transmitted data volume, and
+buffer evolution is a \emph{deterministic} function of the state and the chosen
+action; only the realized viewport (used to score quality after the fact) and the
+next wireless channel gain remain unknown at decision time. This known/random
+split is exactly the \emph{post-decision state} (PDS) construction from approximate
+dynamic programming~\cite{powell_adp}, previously combined with soft-actor-critic in
+a similar streaming setting~\cite{ref_ehs}. % TODO: verify exact EHS citation
+Intuitively, a critic that conditions on the deterministic post-decision quantities
+before bootstrapping should be a Rao-Blackwellized -- and hence lower-variance --
+estimate of the value function than one that bootstraps through the full, still-random
+next state. This paper adapts that PDS mechanism to PPO's on-policy, clipped-surrogate
+setting, distinct from a concurrent, independently-derived PPO+PDS method with different
+advantage equations~\cite{felizardo2025pds}.
+
+\textbf{Contributions.}
+\begin{enumerate}
+\item We derive \emph{PDS-GAE}, a generalization of the original one-step PDS advantage
+that chains the PDS residual through the same backward $\mathrm{GAE}(\lambda)$
+recursion~\cite{schulman2016gae} used by the PPO baseline. We show via an ablation
+that the one-step estimator, not the second-critic architecture itself, was the
+cause of an earlier PDS variant's failure to reach reliable feasibility.
+\item We evaluate PDS-GAE against the PPO baseline across two constraint budgets,
+multiple seeds, and matched training-rollout counts, using the same held-out
+evaluation protocol for every run.
+\item We give direct empirical evidence for PDS-GAE's core theoretical claim -- a
+lower-variance advantage residual -- computed as a zero-extra-cost counterfactual on
+the same rollouts, and connect it to an observed $2$--$3.5\times$ speedup in reaching
+moderate constraint satisfaction.
+\item We identify, and partially diagnose, a persistent feasibility oscillation in
+PDS-GAE that is not present in the PPO baseline and does not resolve with substantially
+more training, reporting the candidate mechanisms we tested and ruled out.
+\item We propose \emph{Virtual Experience} (VE), which reuses one realized,
+action-independent random outcome across several hypothetical actions to generate
+additional PDS-critic training targets at no extra environment-interaction cost. We
+give its algorithm and applicability argument but explicitly do not yet report results
+for it.
+\end{enumerate}
+
+\emph{Notation.} Scalars are non-bold ($a$), vectors bold-lowercase ($\mbf{a}$).
+$\EE[\cdot]$ is the expectation operator, $\gamma$ the discount factor, and
+$[\cdot]_+ \triangleq \max(0,\cdot)$.
+
+% =====================================================================
+\section{Related Work}
+
+\textbf{Base streaming system.} Our CMDP formulation, tile/action space, and
+Lagrangian-PPO baseline follow~\cite{ref_mmsp25} directly; we extend it with a
+post-decision-state critic and evaluate the extension under the same reward and
+constraint structure.
+
+\textbf{Post-decision states.} PDS variables are a long-standing approximate dynamic
+programming tool for separating deterministic and random transition dynamics to
+reduce value-estimation variance~\cite{powell_adp}. \cite{ref_ehs} combines PDS with
+soft actor-critic in a related streaming setting; the one-step advantage we initially
+adapt from that formulation is Eq.~(28)--(29) below. An independent, concurrent PPO+PDS
+method~\cite{felizardo2025pds} uses different advantage equations and is not the
+source of the PDS-GAE trace we derive in Sec.~\ref{sec:method}.
+
+\textbf{Advantage estimation.} PDS-GAE applies the backward, $\lambda$-weighted
+residual-chaining recursion of generalized advantage estimation~\cite{schulman2016gae}
+to the PDS residual in place of the ordinary TD residual; the resulting advantage is
+used inside PPO's clipped surrogate objective~\cite{schulman2017ppo}.
+
+\textbf{Hindsight/counterfactual value estimation.} Virtual Experience's core idea --
+reusing an outcome that is conditionally independent of the action, given the state,
+to obtain lower-variance value information about actions not actually taken -- is a
+member of a broader family that includes hindsight credit assignment~\cite{hca_harutyunyan}
+% TODO: verify exact HCA citation/arXiv id before submission
+and counterfactual credit assignment~\cite{mesnard2021cca}. Neither paper's mechanism
+matches VE's concrete instantiation (recomputing deterministic physics for several
+hypothetical actions against one reused random draw to generate extra post-decision
+critic targets); we treat VE's novelty at the level of \emph{that specific mechanism}
+as plausible but not yet verified against the full literature.
+
+% =====================================================================
+\section{System Model}
+\label{sec:system}
+
+We adopt the CMDP formulation of~\cite{ref_mmsp25}. The panorama is partitioned into
+tiles $\mathcal{N}=\{1,\dots,N\}$. The predicted-viewport tiles are always sent; the
+agent additionally selects any subset of the remaining tiles. The enhanced region and
+action are
+\begin{align}
+\mathcal{E}^t(\mbf{x}^t) &= \{i \in \mathcal{N} : x_i^t = 1\}, \\
+\alpha^t &= (\mbf{x}^t, P^t), \qquad 0 \le P^t \le P_{\max}.
+\end{align}
+The CMDP maximizes discounted viewport quality subject to stall-time, power, and
+tile-count budgets:
+\begin{align}
+\max_\pi \; & \EE_\pi\Big[\textstyle\sum_{t} \gamma^t \bar Q^t_{\text{viewport}}\Big] \\
+\text{s.t. } & \EE_\pi\Big[\textstyle\sum_t \gamma^t D^t / T_0\Big] \le \bar D, \\
+& \EE_\pi\Big[\textstyle\sum_t \gamma^t P^t / P_{\max}\Big] \le \bar P, \\
+& \EE_\pi\Big[\textstyle\sum_t \gamma^t \textstyle\sum_i x_i^t / N\Big] \le \bar B,
+\end{align}
+with $\gamma=0.99$. The penalty-based reward is
+\begin{equation}
+r^t = \beta_q \bar Q^t_{\text{viewport}} - \beta_s \tfrac{D^t}{T_0} - \beta_p \tfrac{P^t}{P_{\max}} - \beta_b \tfrac{\sum_i x_i^t}{N}.
+\end{equation}
+The pre-decision state is $\omega^t = (Z^t, \Delta_\theta^{t-1}, \Delta_\phi^{t-1}, h^t)$
+(buffer level, previous viewport-prediction errors, current channel gain), and coverage
+quality is $\bar Q^t_{\text{viewport}} = C^t_{\text{cov}} = |V^t_{\text{actu}} \cap
+\mathcal{E}^t(\mbf{x}^t)| / |V^t_{\text{actu}}|$, with $V^t_{\text{actu}}$ the actual
+viewport. Once the action is chosen, the enhanced region, transmitted data volume
+$A^t$, transmission rate $R^t$ (Shannon capacity over the UAV--BS channel), stall time
+$D^t$, and the deterministic buffer update $\tilde Z^{t+1}$ are all known; only the
+actual viewport and the next channel gain $h^{t+1}$ remain random.
+
+\textbf{Lagrangian relaxation.} Following~\cite{ref_mmsp25}, fixed weights
+$\beta_s,\beta_p,\beta_b$ are replaced by adaptive multipliers
+$\mu_D,\mu_P,\mu_B \ge 0$, updated once per rollout by projected dual ascent,
+$\mu_j \leftarrow [\mu_j + \eta_\mu (\bar J_j^{\text{rollout}} - \bar b_j)]_+$,
+$j\in\{D,P,B\}$, where $\bar J_j^{\text{rollout}}$ is the sample-average discounted
+constraint return over the rollout's episodes.
+
+% =====================================================================
+\section{Method: PDS-GAE and Virtual Experience}
+\label{sec:method}
+
+\subsection{Post-decision state and the known/random reward split}
+
+The post-decision state retains everything already determined by the action:
+\begin{equation}
+\tilde\omega^t = \big(\tilde Z^{t+1}, \Delta_\theta^{t-1}, \Delta_\phi^{t-1}, h^t, \mathcal{E}^t(\mbf{x}^t)\big).
+\end{equation}
+The reward splits accordingly into a known and a random part,
+\begin{align}
+r^t_{\text{known}} &= -\mu_D c_D^t - \mu_P c_P^t - \mu_B c_B^t, \label{eq:rknown}\\
+r^t_{\text{random}} &= \beta_q C_{\text{cov}}^t, \label{eq:rrandom}
+\end{align}
+with $c_D^t = D^t/T_0$, $c_P^t = P^t/P_{\max}$, $c_B^t = \sum_i x_i^t / N$ the same three
+constraint costs. A second critic $\tilde V_\psi(\tilde\omega^t)$, architecturally
+independent of the ordinary critic $V_\phi(\omega^t)$, is trained toward the one-step
+target
+\begin{equation}
+\tilde y^t = r^t_{\text{random}} + \gamma(1-d^t)\, V_{\text{old}}(\omega^{t+1}), \label{eq:ytilde}
+\end{equation}
+where $d^t{=}1$ at a true episode terminal and $V_{\text{old}}$ denotes the
+pre-decision critic \emph{as evaluated while collecting the rollout} (frozen for the
+policy-gradient step).
+
+\subsection{The original one-step PDS advantage, and why it fails here}
+
+Substituting $Q^\pi(\omega^t,\alpha^t) = r^t_{\text{known}} + \tilde V^\pi(\tilde\omega^t)$
+into $A^\pi = Q^\pi - V^\pi$ gives the PDS residual adapted from~\cite{ref_ehs}:
+\begin{equation}
+\delta_t^{\text{pre}} = r_{\text{known}}^t + \tilde V(\tilde\omega^t) - V_{\text{old}}(\omega^t). \label{eq:delta_pre}
+\end{equation}
+Used directly as the actor's advantage (Run C in our internal ablation naming), this
+one-step estimator truncates credit assignment to a single step. In a
+constrained-Lagrangian environment where a late-episode constraint cost must propagate
+back over a $36$-step episode, an ablation isolating the estimator from the critic
+architecture (an ordinary single critic given the same one-step bootstrap, Run B)
+showed the same qualitative failure as the PDS critic itself (Run C): both plateau with
+two of three multipliers decaying to zero -- i.e., \emph{abandoning} rather than
+satisfying those constraints -- while the GAE($0.95$) baseline (Run A) keeps all three
+multipliers live. This isolates the one-step horizon, not the second critic, as the
+cause, motivating the following generalization.
+
+\subsection{PDS-GAE}
+
+We chain $\delta_t^{\text{pre}}$ through the same backward,
+$\lambda$-weighted recursion GAE~\cite{schulman2016gae} applies to the ordinary TD
+residual:
+\begin{equation}
+\hat A_t^{\text{PDS-GAE}} = \delta_t^{\text{pre}} + \gamma\lambda_{\text{GAE}}(1-d_t)\,\hat A_{t+1}^{\text{PDS-GAE}}, \label{eq:pdsgae}
+\end{equation}
+with $\gamma{=}0.99$, $\lambda_{\text{GAE}}{=}0.95$ matching the baseline exactly, and
+the recursion reset to zero at every true episode terminal. The pre-decision critic is
+fitted to $\hat R_t^{\text{PDS-GAE}} = \hat A_t^{\text{PDS-GAE}} + V_{\text{old}}(\omega^t)$;
+the PDS critic's own target, Eq.~\eqref{eq:ytilde}, is unchanged. At $\lambda_{\text{GAE}}{=}0$
+this collapses exactly to the one-step advantage, Eq.~\eqref{eq:delta_pre}.
+
+\begin{remark}
+Under \emph{exact} on-policy critics, $\delta_t^{\text{pre}}$ already equals the true
+advantage $A^\pi(\omega^t,\alpha^t)$, so later terms in Eq.~\eqref{eq:pdsgae} have
+conditional mean zero given the present action -- the PDS-GAE trace does not inherit
+ordinary GAE's telescoping property in the idealized case. Defining the complementary
+residual $\delta_t^{\text{post}} = r^t_{\text{random}} + \gamma(1{-}d_t)V_{\text{old}}(\omega^{t+1}) - \tilde V(\tilde\omega^t)$,
+one has $\delta_t^{\text{pre}} + \delta_t^{\text{post}} = $ the ordinary PPO TD residual
+exactly; PDS-GAE traces only $\delta_t^{\text{pre}}$. With the \emph{approximate}
+critics used in practice, the resulting bias/variance trade-off is an empirical
+question, evaluated in Sec.~\ref{sec:results}.
+\end{remark}
+
+\begin{algorithm}[t]
+\caption{PPO + Post-Decision State (PDS-GAE)}
+\label{alg:pdsgae}
+\begin{algorithmic}[1]
+\State Initialize actor $\pi_\theta$, critics $V,\tilde V$, multipliers $\mu_D,\mu_P,\mu_B$
+\For{rollout $=1,2,\dots$}
+  \For{$t=0,\dots,n_{\text{steps}}-1$}
+    \State Observe $\omega^t$; predict viewport; sample $\alpha^t \sim \pi_\theta(\cdot|\omega^t)$
+    \State Execute $\alpha^t$, form $\tilde\omega^t$; observe $V^t_{\text{actu}}, h^{t+1}$
+    \State Compute $r^t$, split into $r^t_{\text{known}}, r^t_{\text{random}}$
+    \State Store $(\omega^t,\alpha^t,\tilde\omega^t,r^t_{\text{known}},r^t_{\text{random}},\omega^{t+1},d^t,V_{\text{old}}(\omega^t))$
+  \EndFor
+  \For{each stored step $t$} compute $\tilde y^t$, $\delta_t^{\text{pre}}$ \EndFor
+  \State Backward per episode: compute $\hat A_t^{\text{PDS-GAE}}$, $\hat R_t^{\text{PDS-GAE}}$
+  \State Update $\pi_\theta$ with $\hat A_t^{\text{PDS-GAE}}$; fit $V \to \hat R_t^{\text{PDS-GAE}}$, $\tilde V \to \tilde y^t$
+  \State Update $\mu_D,\mu_P,\mu_B$ once per rollout (dual ascent)
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Virtual Experience (proposed, not yet evaluated)}
+\label{sec:ve}
+
+The actual viewport $V^t_{\text{actu}}$ and next channel gain $h^{t+1}$ are conditionally
+independent of a \emph{hypothetical} action given the current state -- in our
+environment this holds by construction: $h^{t+1}$ is drawn i.i.d.\ from a fixed-parameter
+Rician distribution regardless of the state or action, and $V^t_{\text{actu}}$ replays
+from a pre-recorded head-movement trace. Consequently, the single realized pair
+$(V^t_{\text{actu}}, h^{t+1})$ can be replayed, unchanged, against $M_v$ hypothetical
+actions at the same timestep to generate $M_v$ additional $(\tilde\omega^{t,(m)}, \tilde
+y^{t,(m)})$ training pairs for $\tilde V$ alone, using only the already-deterministic
+physics functions (data-volume, transmission-rate, buffer, and coverage computations) --
+no extra environment interaction.
+
+\begin{algorithm}[t]
+\caption{PDS + Virtual Experience}
+\label{alg:ve}
+\begin{algorithmic}[1]
+\State Initialize $\tilde V$; choose VE batch size $B_{\text{VE}}$, update period $T$
+\For{$t=0,1,2,\dots$}
+  \State Observe $\omega^t$; select $\alpha^t=(\mbf{x}^t,P^t)$; form realized $\tilde\omega^t$
+  \State Observe $V^t_{\text{actu}}, h^{t+1}$; compute $r^t, \omega^{t+1}$
+  \If{$t \bmod T = 0$}
+    \State Construct $\mathcal{B}_{\text{VE}}^t = \{\tilde\omega^{t,(1)},\dots,\tilde\omega^{t,(B_{\text{VE}})}\}$
+    \For{each $\tilde\omega^{t,(b)} \in \mathcal{B}_{\text{VE}}^t$}
+      \State Reuse $V^t_{\text{actu}}, h^{t+1}$; compute virtual $r^{t,(b)}, \omega^{t+1,(b)}$
+      \State Update $\tilde V(\tilde\omega^{t,(b)})$
+    \EndFor
+  \Else
+    \State Update only the realized $\tilde V(\tilde\omega^t)$
+  \EndIf
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+The scheme by which the $B_{\text{VE}}$ hypothetical actions are chosen is an open
+design decision we have not yet fixed: sampling near $\pi_\theta(\cdot|\omega^t)$
+concentrates the extra targets where the policy's own decision boundary lives, while
+uniform sampling over the (combinatorially large, $\mathcal{O}(2^{50})$ effective free
+tile choices at our tile budgets) action space would dilute the benefit. We report no
+empirical results for VE in this paper; Sec.~\ref{sec:discussion} discusses why, given
+our diagnostic findings, we do not expect it to address the feasibility oscillation
+reported in Sec.~\ref{sec:results}.
+
+% =====================================================================
+\section{Experimental Setup}
+
+The environment tiles a $360^{\circ}{\times}180^{\circ}$ panorama into an $8{\times}8$
+grid ($45^{\circ}{\times}22.5^{\circ}$ tiles); the actual-viewport rectangle is
+$120^{\circ}{\times}60^{\circ}$, forcing $9$--$16$ mandatory tiles per step. Episodes are
+$36$ steps; one rollout is $48$ episodes ($1728$ environment steps), $\gamma{=}0.99$.
+We evaluate two budgets, both with the power constraint \emph{genuinely removed}
+(multiplier pinned at $0$ for the run's duration and excluded from the feasibility
+check, not merely loosened): Budget A, $(\bar D,\bar B){=}(0.3,8.0)$; Budget B,
+$(\bar D,\bar B){=}(0.1,8.0)$. Each budget/method pair is trained from multiple
+independent seeds (Budget A: 2 seeds mature at matched rollout count at the time of
+writing, additional seeds in progress; Budget B: 3 seeds). Held-out evaluation uses
+$3$ fixed trace/seed combinations, deliberately \emph{not} refreshed per evaluation
+call, so that all training seeds and both methods are compared against identical test
+conditions. Following our own internal metrics-of-record convention, feasibility
+(constraint satisfaction) is the primary comparison metric; quality among feasible
+rollouts is secondary; raw Lagrangian reward is not used for cross-run comparison,
+since it embeds the (method-specific) multiplier trajectory.
+
+% =====================================================================
+\section{Numerical Results}
+\label{sec:results}
+
+\subsection{Early convergence speed}
+
+Table~\ref{tab:speed} reports, per seed, the first rollout at which a rolling-$20$-window
+mean of the violation metric $\text{viol} = [J_D-\bar D]_+ + [J_B - \bar B]_+$ drops
+below a given threshold and stays there. At the two loosest thresholds, PDS-GAE is
+faster than the matched PPO seed in \emph{every} seed tested, in both budgets
+(speedups of $2.1$--$3.5\times$). This advantage persists to near-exact satisfaction in
+Budget A (every PDS seed faster than every PPO seed), but is contested in Budget B:
+two of three PPO seeds reach near-zero violation faster than all three PDS-GAE seeds,
+with the mean favoring PDS-GAE only because of one markedly slow PPO seed. We report
+both the mean and the per-seed values for this reason -- the mean alone is not a
+robust summary at $n{=}3$.
+
+\begin{table}[t]
+\centering
+\caption{Rollouts to sustained constraint violation below threshold, per seed.}
+\label{tab:speed}
+\begin{tabular}{@{}llrrrr@{}}
+\toprule
+Budget & Method & viol$<5$ & viol$<1$ & viol$\approx 0$ \\
+\midrule
+A & PPO      & 549, 528           & 1166, 1152        & 1920, 2020 \\
+A & PDS-GAE  & \textbf{173, 250}  & \textbf{541, 512}  & \textbf{1432, 1574} \\
+B & PPO      & 576, 731, 499      & 849, 1597, 735     & 975, \emph{3269}, 866 \\
+B & PDS-GAE  & \textbf{187, 232, 143} & 600, 465, 330  & 1281, 1515, 1477 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Mechanism: a measurably lower-variance advantage residual}
+
+For every PDS-GAE rollout, we compute a zero-extra-cost counterfactual: the ordinary TD
+residual on the identical rollout, using arrays already in scope (no extra network
+forward passes). Pooled across all evaluated PDS-GAE arms ($\approx\!20{,}000$
+rollout-rows), the PDS residual's standard deviation is lower than the ordinary
+counterfactual's in $74.3\%$ of rollouts (mean ratio $0.92$, median $0.91$); the
+effect is concentrated early in training (ratio $\approx\!0.65$--$0.85$ in the first
+$200$ rollouts) and shrinks as training progresses (ratio $\approx\!0.93$--$0.98$ late).
+This is directly consistent with Table~\ref{tab:speed}'s pattern: the speed advantage is
+largest and most robust at loose/early convergence and weakens toward strict,
+late-training satisfaction. We note, however, that the correlation between the PDS and
+ordinary advantage estimates is weak ($0.11$--$0.28$) and their sign agreement is barely
+above chance ($53$--$55\%$) -- the PDS residual is a lower-variance estimate of a
+signal that is only partly the same as the ordinary one, not simply a cleaner version
+of it.
+
+\subsection{Final reliability and quality}
+
+Table~\ref{tab:final} reports tail-window (last $200$ rollouts) statistics. PPO reaches
+higher final feasibility than PDS-GAE in both budgets. Quality among feasible rollouts
+(PSNR, and the discounted quality return $J_Q$) does not favor either method
+consistently across budgets: PDS-GAE is slightly ahead in Budget B, PPO slightly ahead
+in Budget A -- we report both rather than the single-budget snapshot that would
+otherwise overstate a general quality advantage.
+
+\begin{table}[t]
+\centering
+\caption{Tail-window (last 200 rollouts) comparison.}
+\label{tab:final}
+\begin{tabular}{@{}llrrr@{}}
+\toprule
+Budget & Method & Feasible \% & PSNR (dB)$^\dagger$ & $J_Q^\dagger$ \\
+\midrule
+A & PPO      & \textbf{100.0} & \textbf{51.92} & \textbf{25.58} \\
+A & PDS-GAE  & 69.8  & 51.88 & 25.47 \\
+B & PPO      & \textbf{94.8}  & 51.87 & 25.42 \\
+B & PDS-GAE  & 59.7  & \textbf{51.94} & \textbf{25.58} \\
+\bottomrule
+\end{tabular}
+\vspace{2pt}
+\raggedright{\footnotesize $^\dagger$ Computed over feasible rollouts only.}
+\end{table}
+
+\subsection{A persistent, reproducible feasibility oscillation}
+
+Beyond the tail-window snapshot, the full training trajectory (Fig.~\ref{fig:violation})
+shows a qualitative difference between methods: PPO, once it first reaches feasibility,
+settles into long, stable plateaus (in Budget A, a flat $100\%$ for over $2{,}000$
+consecutive rollouts with no dips). PDS-GAE reaches high feasibility \emph{earlier} in
+both budgets but never stabilizes the same way -- it oscillates repeatedly for the
+remainder of training, independently reproduced in both budgets over $4{,}000+$
+rollouts. This is, to our knowledge, a genuine and reproducible property of PDS-GAE in
+this setting, not a transient one-off relapse.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{../FINAL_PART1_EXP/official_multiseed/A_dropP/01_violation.png}
+\caption{Constraint violation and rolling feasible-\% over the full training
+trajectory, Budget A (mean $\pm$ 1 std across seeds). PPO stabilizes after first
+reaching feasibility; PDS-GAE does not.}
+\label{fig:violation}
+\end{figure}
+
+% =====================================================================
+\section{Discussion and Limitations}
+\label{sec:discussion}
+
+\textbf{What the oscillation is not.} We tested, and did not find support for, an
+actor-update-aggressiveness explanation: at four independent relapse events, PPO's own
+training diagnostics (approximate KL divergence, policy entropy, clip fraction) were
+flat across the transition into relapse, not spiking. The PDS advantage magnitude
+(std\_adv\_pds) also did not shrink during the periods of unresponsiveness we examined,
+ruling out a vanishing-training-signal explanation.
+
+\textbf{Partial evidence found.} (i) The policy's discretionary tile-count behavior
+responded only slowly to a correctly, monotonically rising tile-budget multiplier near
+the constraint boundary, in one case remaining flat for $600{+}$ rollouts despite
+continued multiplier growth -- by contrast, the PPO baseline's tile count tracked its
+own rising multiplier closely and promptly in the same cell. (ii) A genuine (not
+sampling-noise, since evaluation seeds are fixed) gap between training-side and
+held-out constraint costs on the stall dimension, whose breadth we cannot yet attribute
+to broad generalization failure versus idiosyncrasy of the (necessarily small, $n{=}3$)
+held-out trace set. (iii) In the budget with the larger feasibility gap, PDS-GAE's
+policy entropy remained persistently higher late in training than most PPO seeds',
+consistent with -- though not proof of -- incomplete convergence to a deterministic
+policy.
+
+\textbf{Why we do not evaluate VE in this paper.} VE (Sec.~\ref{sec:ve}) targets
+sampling efficiency of the PDS critic's own training signal. Given (a) the measured
+residual-variance advantage already shrinks on its own as real training data
+accumulates, and (b) none of the mechanisms above implicate critic sample-starvation as
+the oscillation's cause, we do not expect VE, even if implemented exactly as specified,
+to resolve the reliability gap reported in Sec.~\ref{sec:results}. We regard it as a
+theoretically well-motivated, cheaply implementable extension worth evaluating
+separately, not a fix for the finding in this paper.
+
+\textbf{Limitations.} Results use two budgets and $2$--$3$ mature seeds per
+arm; additional seeds were in progress at submission time. % TODO: update seed counts / add
+% new results here once the additional seeds mature -- see paper/NOTES.md
+The held-out evaluation set is necessarily small (3 traces); broadening it is planned
+future work, as is a targeted experiment raising the constraint-multiplier learning
+rate to test the slow-responsiveness hypothesis above directly.
+
+% =====================================================================
+\section{Conclusion}
+
+We adapted the post-decision-state critic mechanism to PPO for a constrained UAV
+360\textdegree{} streaming CMDP, showed empirically and diagnostically that its
+originally-proposed one-step advantage truncates credit assignment, and derived
+PDS-GAE to address this. PDS-GAE reaches moderate constraint satisfaction
+substantially faster than a matched PPO baseline in every seed tested, an effect we
+connect directly to a measured reduction in advantage-estimator variance early in
+training. This advantage does not yet extend to final reliability: PDS-GAE shows a
+persistent, reproducible feasibility oscillation that we characterize but do not fully
+resolve here. We proposed Virtual Experience as a theoretically motivated extension and
+argued, on diagnostic grounds, why it is unlikely to be a fix for this specific gap,
+leaving its empirical evaluation, along with a broader multiplier-learning-rate study
+and a wider held-out trace set, to future work.
+
+% =====================================================================
+\begin{thebibliography}{9}
+
+\bibitem{ref_mmsp25}
+% TODO: replace with the real MMSP'25 baseline-paper citation (authors, title, venue, year).
+
+\bibitem{ref_ehs}
+% TODO: replace with the real EHS SAC+PDS paper citation.
+
+\bibitem{felizardo2025pds}
+G.~S.~Felizardo \emph{et al.}, ``A Reinforcement Learning Method for Environments with
+Stochastic Variables: Post-Decision Proximal Policy Optimization with Dual Critic
+Networks,'' \emph{arXiv:2504.05150}, 2025.
+
+\bibitem{powell_adp}
+W.~B.~Powell, \emph{Approximate Dynamic Programming: Solving the Curses of
+Dimensionality}, 2nd ed. Wiley, 2011.
+
+\bibitem{schulman2016gae}
+J.~Schulman, P.~Moritz, S.~Levine, M.~Jordan, and P.~Abbeel, ``High-Dimensional
+Continuous Control Using Generalized Advantage Estimation,'' \emph{arXiv:1506.02438},
+2016.
+
+\bibitem{schulman2017ppo}
+J.~Schulman, F.~Wolski, P.~Dhariwal, A.~Radford, and O.~Klimov, ``Proximal Policy
+Optimization Algorithms,'' \emph{arXiv:1707.06347}, 2017.
+
+\bibitem{hca_harutyunyan}
+A.~Harutyunyan \emph{et al.}, ``Hindsight Credit Assignment,'' \emph{NeurIPS}, 2019.
+% TODO: verify exact venue/arXiv id before submission.
+
+\bibitem{mesnard2021cca}
+T.~Mesnard \emph{et al.}, ``Counterfactual Credit Assignment in Model-Free
+Reinforcement Learning,'' \emph{arXiv:2011.09464}, 2021.
+
+\end{thebibliography}
+
+\end{document}

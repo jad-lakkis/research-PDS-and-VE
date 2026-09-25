@@ -17,6 +17,8 @@ ent_tests/
 EXP1_D_VS_A/
 run_D_clean_results/
 baseline_A_key_metrics/
+FINAL_PART1_EXP/
+FINAL_PART1_EXP_M/
 *.zip
 *.pkl
 
