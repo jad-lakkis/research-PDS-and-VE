@@ -51,6 +51,19 @@ from streaming_rl.lagrangian import (
 from streaming_rl.eval import HeldOutTraceEvalCallback
 
 
+# Column order for <log_dir>/train_episodes.csv, written by
+# LagrangianMultiplierCallback. One row per completed training episode
+# (~48/rollout) - the per-episode J_D/J_P/J_B this callback already
+# buffers to compute avg_J_D/P/B, but previously discarded after
+# averaging. This is what "what fraction of the 48 episodes exceeded the
+# constraint" (and any per-episode framing) needs and avg_J_D/P/B alone
+# cannot answer.
+TRAIN_EPISODE_COLUMNS = [
+    "rollout", "total_timesteps", "env_index",
+    "J_D", "J_P", "J_B", "viol_D", "viol_P", "viol_B", "violation", "feasible",
+]
+
+
 class LagrangianMultiplierCallback(BaseCallback):
     """Top-level callback (see module docstring for why, re: on_rollout_end
     forwarding). _on_step() collects info["J_D"]/["J_P"]/["J_B"] out of
@@ -60,10 +73,19 @@ class LagrangianMultiplierCallback(BaseCallback):
     calls and strictly before the policy update - averages J_D/J_P/J_B
     across however many episodes fully completed this rollout and does
     one dual_ascent_step per multiplier.
+
+    When log_dir is given, also appends every individual episode's
+    J_D/J_P/J_B (plus the same dropped-constraints-aware violation/
+    feasible derivation eval.py uses) to <log_dir>/train_episodes.csv
+    before the buffers are cleared - purely additive, does not change
+    the multiplier update above. Opened in append mode with the header
+    written only when the file is missing/empty, matching
+    streaming_rl.eval.EvalStepTraceWriter's --resume-from-safe convention.
     """
 
     def __init__(self, d_bar: float, p_bar: float, b_bar: float, eta: float,
-                 dropped_constraints: frozenset = frozenset(), verbose: int = 0):
+                 dropped_constraints: frozenset = frozenset(), log_dir: str = None,
+                 feasibility_tol: float = 1e-9, verbose: int = 0):
         super().__init__(verbose)
         self.d_bar, self.p_bar, self.b_bar, self.eta = d_bar, p_bar, b_bar, eta
         # Dropped constraints' multipliers stay pinned at their 0.0 init
@@ -71,19 +93,36 @@ class LagrangianMultiplierCallback(BaseCallback):
         # never touches them, so they never drift off 0 regardless of
         # J_X. Genuine removal, not a loose budget.
         self.dropped_constraints = frozenset(dropped_constraints)
+        self.feasibility_tol = feasibility_tol
         self._J_D_buffer: list = []
         self._J_P_buffer: list = []
         self._J_B_buffer: list = []
+        self._env_index_buffer: list = []
+        self._rollout_count = 0
+
+        self._episode_csv_writer = None
+        self._episode_csv_fh = None
+        if log_dir is not None:
+            os.makedirs(log_dir, exist_ok=True)
+            path = os.path.join(log_dir, "train_episodes.csv")
+            write_header = (not os.path.exists(path)) or os.path.getsize(path) == 0
+            self._episode_csv_fh = open(path, "a", newline="")
+            self._episode_csv_writer = csv.writer(self._episode_csv_fh)
+            if write_header:
+                self._episode_csv_writer.writerow(TRAIN_EPISODE_COLUMNS)
+                self._episode_csv_fh.flush()
 
     def _on_step(self) -> bool:
-        for info in self.locals["infos"]:
+        for env_index, info in enumerate(self.locals["infos"]):
             if "J_D" in info:   # terminal step only
                 self._J_D_buffer.append(info["J_D"])
                 self._J_P_buffer.append(info["J_P"])
                 self._J_B_buffer.append(info["J_B"])
+                self._env_index_buffer.append(env_index)
         return True
 
     def _on_rollout_end(self) -> None:
+        self._rollout_count += 1
         n = len(self._J_D_buffer)
         self.logger.record("lagrangian/n_episodes", n)
         if n == 0:
@@ -109,9 +148,25 @@ class LagrangianMultiplierCallback(BaseCallback):
                            ("avg_J_D", avg_J_D), ("avg_J_P", avg_J_P), ("avg_J_B", avg_J_B)]:
             self.logger.record(f"lagrangian/{name}", val)
 
+        if self._episode_csv_writer is not None:
+            rows = []
+            for env_index, J_D, J_P, J_B in zip(
+                self._env_index_buffer, self._J_D_buffer, self._J_P_buffer, self._J_B_buffer
+            ):
+                viol_D = 0.0 if "D" in self.dropped_constraints else max(0.0, J_D - self.d_bar)
+                viol_P = 0.0 if "P" in self.dropped_constraints else max(0.0, J_P - self.p_bar)
+                viol_B = 0.0 if "B" in self.dropped_constraints else max(0.0, J_B - self.b_bar)
+                violation = viol_D + viol_P + viol_B
+                feasible = float(violation <= self.feasibility_tol)
+                rows.append([self._rollout_count, self.num_timesteps, env_index,
+                             J_D, J_P, J_B, viol_D, viol_P, viol_B, violation, feasible])
+            self._episode_csv_writer.writerows(rows)
+            self._episode_csv_fh.flush()
+
         self._J_D_buffer.clear()
         self._J_P_buffer.clear()
         self._J_B_buffer.clear()
+        self._env_index_buffer.clear()
 
 
 class PhysicalMetricsCallback(BaseCallback):
@@ -356,7 +411,7 @@ def main():
     if use_lagrangian:
         callbacks.append(LagrangianMultiplierCallback(
             d_bar=d_bar, p_bar=p_bar, b_bar=b_bar, eta=config.MU_LEARNING_RATE,
-            dropped_constraints=dropped_constraints,
+            dropped_constraints=dropped_constraints, log_dir=args.log_dir,
         ))
     callbacks.append(HeldOutTraceEvalCallback(
         d_bar=d_bar, p_bar=p_bar, b_bar=b_bar,

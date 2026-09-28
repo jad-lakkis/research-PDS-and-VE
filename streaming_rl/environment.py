@@ -54,6 +54,7 @@ from gymnasium import spaces
 
 import config
 from streaming_rl import data_loader, channel_model, layer_model, viewport
+from streaming_rl import pds as pds_module
 
 
 class TileStreamingEnv(gym.Env):
@@ -162,12 +163,10 @@ class TileStreamingEnv(gym.Env):
         return viewport.yaw_pitch_to_theta_phi(yaw, pitch)
 
     def _unpack_action(self, action) -> tuple:
-        action = np.asarray(action)
-        tile_mask = action[: config.N_TILES].astype(bool)
-        power_level_idx = int(action[config.N_TILES])
-        power_fraction = (power_level_idx / (config.N_POWER_LEVELS - 1)) * config.POWER_LEVEL_MAX_FRACTION
-        power_watts = power_fraction * self._P_max_watts
-        return tile_mask, power_watts
+        # Delegates to pds.unpack_action() - single source of truth, also
+        # used by virtual-experience hypothetical-action decoding, so the
+        # two can never silently drift apart.
+        return pds_module.unpack_action(action)
 
     def _observation(self, Z, delta_theta, delta_phi, h) -> np.ndarray:
         # h is pre-scaled here ONLY - every other consumer of h (channel_model,
@@ -206,6 +205,17 @@ class TileStreamingEnv(gym.Env):
 
     def step(self, action):
         t = self._gop_index
+        # Snapshot the PRE-step Z^t/h^t before the end-of-step block below
+        # overwrites self._Z/self._h with Z_next/h_next - same reasoning/bug
+        # shape as pred_theta_used/pred_phi_used below (self._Z/self._h
+        # would otherwise read as the NEXT step's values by the time info
+        # is built). Needed for virtual-experience hypothetical-branch
+        # physics recomputation, which requires the real, already-known
+        # Z^t/h^t - not available anywhere else in raw physical units
+        # (info["Z"] is the POST-step Z~^{t+1}, and self._last_obs in
+        # collect_rollouts is VecNormalize-normalized, not raw).
+        Z_t_used = self._Z
+        h_t_used = self._h
         agent_tile_mask, power_watts = self._unpack_action(action)
 
         # eq. 2: predicted-viewport tiles are always enhanced ("assigned
@@ -300,6 +310,24 @@ class TileStreamingEnv(gym.Env):
             # bit-volume, even though MMSP'25's own notation reads as a
             # playout-seconds buffer. Purely additive, for diagnostics.
             "Z": Z_next,
+            # Raw, pre-step Z^t/h^t (physical units, NOT VecNormalize-
+            # normalized) - for virtual-experience hypothetical-branch
+            # physics recomputation only; every other consumer of buffer/
+            # channel state uses "Z" (post-step) or the normalized obs.
+            "Z_t": Z_t_used,
+            "h_t": h_t_used,
+            # Env-internal GOP index THIS step used for its video-data
+            # lookup (compute_A_t/coverage/_actual_theta_phi all key off
+            # this) - cycles 0..H-1 per episode, distinct from the
+            # rollout-local step counter collect_rollouts tracks for the
+            # VE-trigger condition. Needed so a virtual branch's
+            # compute_A_t call indexes the exact same GOP the real step did.
+            "gop_index": t,
+            # Raw next-step channel gain h^{t+1} - already sampled above
+            # (independent of the action, reused identically across every
+            # virtual-experience branch), but otherwise only consumed
+            # internally to build the next observation/self._h.
+            "h_next": h_next,
             "coverage": coverage_t,
             "viewport_psnr_db": viewport_psnr_db,
             "tile_mask": tile_mask.astype(np.uint8),  # which of the 64 tiles, for Stage 8 per-tile tracking

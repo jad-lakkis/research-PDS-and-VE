@@ -58,6 +58,14 @@ class PDSRolloutBuffer(RolloutBuffer):
         self.truncateds = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         self.ordinary_returns = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         self.pds_returns = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+        # Virtual-experience pairs (v3 Algorithm 2) - variable total count
+        # (n_ve_events_per_env * n_envs * ve_batch_size, only known once
+        # collection finishes), so a growing list of per-VE-event batches
+        # is simpler and no less correct than pre-sizing; concatenated
+        # once in get_virtual_pairs(). Empty (VE disabled, or
+        # ve_batch_size=0) is a completely valid, common state.
+        self._virtual_pds_observations: list = []
+        self._virtual_pds_returns: list = []
 
     def add(
         self,
@@ -85,6 +93,24 @@ class PDSRolloutBuffer(RolloutBuffer):
         self.terminateds[pos] = np.array(terminated)
         self.truncateds[pos] = np.array(truncated)
         super().add(obs, action, reward, episode_start, value, log_prob)
+
+    def add_virtual_pairs(self, pds_obs_batch: np.ndarray, returns_batch: np.ndarray) -> None:
+        """Append one VE-triggering step's worth of virtual (pds_obs,
+        target) pairs - called zero or more times per rollout, from
+        PPOWithPDS.collect_rollouts(), each call already covering every
+        n_envs x ve_batch_size branch for that step."""
+        self._virtual_pds_observations.append(np.asarray(pds_obs_batch, dtype=np.float32))
+        self._virtual_pds_returns.append(np.asarray(returns_batch, dtype=np.float32))
+
+    def get_virtual_pairs(self):
+        """(pds_obs, returns) as torch tensors pooled across every VE
+        event this rollout, or (None, None) if none were collected (VE
+        disabled, or ve_batch_size=0 - both valid, common states)."""
+        if not self._virtual_pds_observations:
+            return None, None
+        obs = np.concatenate(self._virtual_pds_observations, axis=0)
+        returns = np.concatenate(self._virtual_pds_returns, axis=0)
+        return self.to_torch(obs), self.to_torch(returns)
 
     def compute_pds_returns_and_advantage(self, policy, last_values: th.Tensor, gae_lambda: float) -> None:
         """Phase B of the PPO+PDS pseudocode. Must be called once, after the

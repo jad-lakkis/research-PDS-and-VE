@@ -130,6 +130,45 @@ class EvalStepTraceWriter:
         self._staged.clear()
 
 
+# Column order for <log_dir>/eval_episodes.csv, written by
+# EvalEpisodeWriter. One row per held-out eval episode (3/eval) - the
+# per-episode J_D/J_P/J_B _on_rollout_end below already computes via
+# EpisodeResult, but previously only logged as an already-averaged
+# eval/J_D etc. This is what per-episode (rather than per-rollout)
+# framing of the constraint/violation needs.
+EVAL_EPISODE_COLUMNS = [
+    "rollout", "total_timesteps", "trace_position", "seed",
+    "J_D", "J_P", "J_B", "viol_D", "viol_P", "viol_B", "violation", "feasible",
+]
+
+
+class EvalEpisodeWriter:
+    """Per-eval-episode J_D/J_P/J_B and derived violation ->
+    <log_dir>/eval_episodes.csv.
+
+    Unlike EvalStepTraceWriter, every eval's rows are kept unconditionally -
+    3 rows/eval is negligible, and unlike the spatial trace there is no
+    "is this eval worth it" question to defer. Same append-mode,
+    header-written-only-if-missing/empty convention as EvalStepTraceWriter,
+    for the same --resume-from reason.
+    """
+
+    def __init__(self, log_dir: str):
+        os.makedirs(log_dir, exist_ok=True)
+        self._path = os.path.join(log_dir, "eval_episodes.csv")
+        write_header = (not os.path.exists(self._path)) or os.path.getsize(self._path) == 0
+        self._fh = open(self._path, "a", newline="")
+        self._writer = csv.writer(self._fh)
+        if write_header:
+            self._writer.writerow(EVAL_EPISODE_COLUMNS)
+            self._fh.flush()
+
+    def write_rows(self, rows: list) -> None:
+        if rows:
+            self._writer.writerows(rows)
+            self._fh.flush()
+
+
 @dataclass
 class EpisodeResult:
     trace_position: int
@@ -236,6 +275,7 @@ class HeldOutTraceEvalCallback(BaseCallback):
         self._rollout_count = 0
         self._eval_envs = None
         self._step_trace_writer = None
+        self._episode_writer = None
         self.best_key = (1, float("inf"), float("inf"))
         self.best_checkpoint_step = None
 
@@ -253,6 +293,7 @@ class HeldOutTraceEvalCallback(BaseCallback):
             for idx in self.eval_trace_indices
         ]
         self._step_trace_writer = EvalStepTraceWriter(self.log_dir)
+        self._episode_writer = EvalEpisodeWriter(self.log_dir)
 
     def _on_step(self) -> bool:
         return True   # all logic runs in _on_rollout_end; abstract method must exist
@@ -290,6 +331,19 @@ class HeldOutTraceEvalCallback(BaseCallback):
         viol_B = 0.0 if "B" in self.dropped_constraints else max(0.0, J_B - self.b_bar)
         violation = viol_D + viol_P + viol_B
         feasible = violation <= self.feasibility_tol
+
+        episode_rows = []
+        for r in results:
+            e_viol_D = 0.0 if "D" in self.dropped_constraints else max(0.0, r.J_D - self.d_bar)
+            e_viol_P = 0.0 if "P" in self.dropped_constraints else max(0.0, r.J_P - self.p_bar)
+            e_viol_B = 0.0 if "B" in self.dropped_constraints else max(0.0, r.J_B - self.b_bar)
+            e_violation = e_viol_D + e_viol_P + e_viol_B
+            e_feasible = float(e_violation <= self.feasibility_tol)
+            episode_rows.append([
+                self._rollout_count, self.num_timesteps, r.trace_position, r.seed,
+                r.J_D, r.J_P, r.J_B, e_viol_D, e_viol_P, e_viol_B, e_violation, e_feasible,
+            ])
+        self._episode_writer.write_rows(episode_rows)
 
         for name, val in [
             ("J_Q", J_Q), ("J_D", J_D), ("J_P", J_P), ("J_B", J_B),

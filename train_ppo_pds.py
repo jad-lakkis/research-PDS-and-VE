@@ -85,6 +85,19 @@ def parse_args():
                          "reward and feasibility check, e.g. 'P' or 'P,B' (default: none dropped)")
     p.add_argument("--eval-freq-rollouts", type=int, default=1,
                     help="run held-out-trace evaluation every N rollouts")
+    # Virtual experience (v3 formulation, Algorithm 2) - off by default,
+    # so every existing PDS-only invocation is completely unaffected.
+    # Only meaningful on a fresh start, not --resume-from (see
+    # PPOWithPDS.__init__ - not yet verified that a resumed run restores
+    # these from the saved model rather than falling back to these
+    # defaults; check before resuming a VE run specifically).
+    p.add_argument("--ve-enabled", action="store_true",
+                    help="enable virtual-experience PDS-critic training (default off)")
+    p.add_argument("--ve-batch-size", type=int, default=0,
+                    help="B_VE: hypothetical actions sampled per VE event (required > 0 if --ve-enabled)")
+    p.add_argument("--ve-period", type=int, default=10,
+                    help="T: VE event every T rollout-local steps (0-indexed, matches v3 Algorithm 2's "
+                         "own t - i.e. t=0,T,2T,... within each rollout, not a continuous run-wide counter)")
     p.add_argument("--log-dir", type=str, default="runs/ppo_pds_run")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--resume-from", type=str, default=None,
@@ -131,17 +144,20 @@ def main():
         model = PPOWithPDS(env=train_venv, n_steps=args.n_steps, gamma=config.PPO_GAMMA,
                             gae_lambda=args.gae_lambda, ent_coef=ent_coef,
                             clip_range_vf=args.clip_range_vf, seed=args.seed,
+                            ve_enabled=args.ve_enabled, ve_batch_size=args.ve_batch_size,
+                            ve_period=args.ve_period,
                             verbose=1, device=args.device)
         print(f"Fresh start: d_bar={d_bar} p_bar={p_bar} b_bar={b_bar} ent_coef={ent_coef} "
               f"gae_lambda={args.gae_lambda} clip_range_vf={args.clip_range_vf} "
-              f"pds_critic_architecture={config.PDS_CRITIC_ARCHITECTURE}")
+              f"pds_critic_architecture={config.PDS_CRITIC_ARCHITECTURE} "
+              f"ve_enabled={args.ve_enabled} ve_batch_size={args.ve_batch_size} ve_period={args.ve_period}")
     model.set_logger(sb3_configure(args.log_dir, ["stdout", "csv"]))
 
     callbacks = [
         PhysicalMetricsCallback(),
         TileEnhancementTrackerCallback(log_dir=args.log_dir),
         LagrangianMultiplierCallback(d_bar=d_bar, p_bar=p_bar, b_bar=b_bar, eta=config.MU_LEARNING_RATE,
-                                      dropped_constraints=dropped_constraints),
+                                      dropped_constraints=dropped_constraints, log_dir=args.log_dir),
         HeldOutTraceEvalCallback(
             d_bar=d_bar, p_bar=p_bar, b_bar=b_bar,
             best_model_save_path=os.path.join(args.log_dir, "best"),

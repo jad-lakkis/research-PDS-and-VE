@@ -13,6 +13,7 @@ the env's own info dict, so they're testable in isolation.
 import numpy as np
 
 import config
+from streaming_rl import channel_model, layer_model, viewport
 
 # Z-tilde (1) + Delta_theta^{t-1}, Delta_phi^{t-1}, h^t (3, reused from
 # omega^t as-is) + tile_mask E^t(x^t) (config.N_TILES) = 68  (eq. 16)
@@ -50,6 +51,34 @@ def build_pds_observation(obs: np.ndarray, true_next_obs: np.ndarray, tile_mask:
     return pds_obs
 
 
+def unpack_action(action) -> tuple:
+    """(tile_mask, power_watts) from a raw MultiDiscrete([2]*N_TILES +
+    [N_POWER_LEVELS]) action array. Single source of truth, shared by
+    TileStreamingEnv._unpack_action (the real executed action) and
+    virtual-experience hypothetical-action sampling - avoids the two
+    ever drifting apart.
+    """
+    action = np.asarray(action)
+    tile_mask = action[:config.N_TILES].astype(bool)
+    power_level_idx = int(action[config.N_TILES])
+    power_fraction = (power_level_idx / (config.N_POWER_LEVELS - 1)) * config.POWER_LEVEL_MAX_FRACTION
+    power_watts = power_fraction * channel_model.dbm_to_watts(config.P_MAX_DBM)
+    return tile_mask, power_watts
+
+
+def build_raw_next_pds_state(Z_next_b: float, delta_theta_t: float, delta_phi_t: float, h_next: float) -> np.ndarray:
+    """Raw (un-normalized) omega^{t+1,(b)} = (Z_next_b, delta_theta_t,
+    delta_phi_t, h_next*PRESCALE) - matches environment.py::_observation()'s
+    own raw representation exactly, including the h prescale
+    (config.H_OBSERVATION_PRESCALE) applied BEFORE VecNormalize ever sees
+    it. Caller still has to run this through VecNormalize.normalize_obs()
+    before it's network-ready - this module stays SB3/torch-free.
+    """
+    return np.array(
+        [Z_next_b, delta_theta_t, delta_phi_t, h_next * config.H_OBSERVATION_PRESCALE], dtype=np.float32
+    )
+
+
 def split_reward(info: dict, mu_d: float, mu_p: float, mu_b: float, beta_q: float = config.BETA_Q) -> tuple:
     """(r_known^t, r_random^t)  (eqs. 18-20), from the env's own per-step
     cost/coverage fields plus the LIVE Lagrange multipliers.
@@ -57,3 +86,61 @@ def split_reward(info: dict, mu_d: float, mu_p: float, mu_b: float, beta_q: floa
     r_known = -mu_d * info["cost_D"] - mu_p * info["cost_P"] - mu_b * info["cost_B"]
     r_random = beta_q * info["coverage"]
     return float(r_known), float(r_random)
+
+
+def compute_virtual_branch_physics(
+    agent_tile_mask_b: np.ndarray, power_watts_b: float, mandatory_tile_mask: np.ndarray,
+    rd_data: dict, video_array_index: int, gop_index: int, enhanced_level: int,
+    Z_t: float, h_t: float, actual_theta_t: float, actual_phi_t: float,
+    mu_d: float, mu_p: float, mu_b: float, beta_q: float = config.BETA_Q,
+) -> dict:
+    """Recompute the deterministic known-quantities (eqs. 11-14) and
+    known/random reward split (eqs. 18-20) for ONE hypothetical action
+    alpha^{t,(b)} = (agent_tile_mask_b, power_watts_b) at the real
+    pre-decision state - the physics half of a virtual-experience branch
+    (v3 formulation, "Virtual experience" section: "recompute the known
+    data, rate, stall, buffer, coverage, and hypothetical next state").
+
+    Z_t/h_t/actual_theta_t/actual_phi_t are the REAL, already-known
+    quantities at this step (Z_t/h_t pre-decision, actual_theta_t/phi_t
+    the REAL observed viewport, reused unchanged - never recomputed per
+    branch, since neither depends on the action). Deliberately does NOT
+    touch h^{t+1}, Delta_theta^t/phi^t, VecNormalize, or the PDS critic's
+    forward pass - this module stays SB3/torch-free (see module
+    docstring); the caller assembles omega~^{t,(b)}/omega^{t+1,(b)} and
+    calls predict_values() itself, batched across the whole VE batch.
+
+    Returns {"tile_mask_b", "Z_next_b", "r_known_b", "r_random_b",
+    "coverage_b"} - all raw Python/numpy, no torch.
+    """
+    tile_mask_b = np.asarray(agent_tile_mask_b, dtype=bool) | np.asarray(mandatory_tile_mask, dtype=bool)
+
+    a_result_b = layer_model.compute_A_t(
+        rd_data, video_array_index, gop_index, tile_mask_b, enhanced_level=enhanced_level,
+    )
+    A_t_b = a_result_b["A_t"]
+    R_t_b = channel_model.transmission_rate(power_watts_b, h_t)
+
+    T0 = config.T0_SEC
+    if Z_t + T0 * R_t_b >= A_t_b:
+        D_t_b = 0.0
+    else:
+        D_t_b = T0 * (1.0 - (Z_t + T0 * R_t_b) / A_t_b)
+    Z_next_b = max(Z_t + T0 * R_t_b - A_t_b, 0.0)
+
+    P_max_watts = channel_model.dbm_to_watts(config.P_MAX_DBM)
+    cost_D_b = D_t_b / T0
+    cost_P_b = power_watts_b / P_max_watts
+    cost_B_b = float(tile_mask_b.sum()) / config.N_TILES
+    r_known_b = -mu_d * cost_D_b - mu_p * cost_P_b - mu_b * cost_B_b
+
+    coverage_b = viewport.coverage(tile_mask_b, actual_theta_t, actual_phi_t)
+    r_random_b = beta_q * coverage_b
+
+    return {
+        "tile_mask_b": tile_mask_b,
+        "Z_next_b": float(Z_next_b),
+        "r_known_b": float(r_known_b),
+        "r_random_b": float(r_random_b),
+        "coverage_b": float(coverage_b),
+    }
