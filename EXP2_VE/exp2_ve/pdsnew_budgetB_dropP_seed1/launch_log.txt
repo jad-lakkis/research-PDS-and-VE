@@ -1,0 +1,2 @@
+2026-09-29 06:01:27 [pdsnew_budgetB_dropP_seed1] launching (pdsnew, seed=1, run-until-stopped)
+2026-09-29 12:41:26 [pdsnew_budgetB_dropP_seed1] process exited with code -9

@@ -1,0 +1,2 @@
+2026-09-29 06:01:17 [pdsve_budgetA_dropP_seed5] launching (pdsve, seed=5, run-until-stopped)
+2026-09-29 14:29:31 [pdsve_budgetA_dropP_seed5] process exited with code -9

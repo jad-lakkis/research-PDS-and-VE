@@ -133,6 +133,22 @@ class PPOWithPDS(PPO):
         if ve_seed is not None:
             self._ve_generator.manual_seed(ve_seed)
 
+    def _excluded_save_params(self) -> list:
+        # _ve_rd_data caches the ENTIRE rd.mat (all 15 videos' RD tables,
+        # not just the training one - data_loader.load_rd_data()) directly
+        # on self (see collect_rollouts) so it isn't re-fetched via
+        # env.get_attr() every rollout. Without this exclusion it gets
+        # pickled into data.pkl on every model.save() call - the actual
+        # cause of VE checkpoints being ~640MB instead of ~0.4MB. Safe to
+        # exclude: collect_rollouts re-fetches both attributes fresh from
+        # the env on first use after load/resume (hasattr(self,
+        # "_ve_rd_data") is False on a freshly constructed/loaded model
+        # regardless), identical content either way - not needed for
+        # correctness, unlike _ve_generator (kept in the save - its RNG
+        # state carrying across --resume-from is a verified, relied-on
+        # property, not an oversight).
+        return super()._excluded_save_params() + ["_ve_rd_data", "_ve_enhanced_level"]
+
     def collect_rollouts(self, env, callback, rollout_buffer, n_rollout_steps) -> bool:
         assert self._last_obs is not None, "No previous observation was provided"
         self.policy.set_training_mode(False)
