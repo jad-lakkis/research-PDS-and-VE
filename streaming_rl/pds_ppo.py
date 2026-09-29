@@ -45,9 +45,33 @@ from streaming_rl.pds_buffer import PDSRolloutBuffer
 from streaming_rl.pds_policy import PDSActorCriticPolicy
 
 
+def _sample_multicategorical(distribution, generator: th.Generator) -> th.Tensor:
+    """One fresh sample from an already-configured MultiCategoricalDistribution
+    (SB3 stable_baselines3.common.distributions), drawn from `generator`
+    instead of torch's default/global RNG stream.
+
+    Replicates MultiCategoricalDistribution.sample()'s own behavior
+    (th.stack([dist.sample() for dist in self.distribution], dim=1)) but
+    substitutes torch.multinomial's generator= argument, which
+    Categorical.sample()'s own public API does not expose. Verified to
+    produce identical shape/dtype to the original .sample() (each
+    sub-Categorical's .probs has shape (n_envs, num_categories);
+    multinomial(..., num_samples=1) gives (n_envs, 1), squeezed to
+    (n_envs,) then stacked across the 65 tile/power dimensions to
+    (n_envs, 65) - matching MultiDiscrete([2]*N_TILES + [N_POWER_LEVELS])
+    exactly, same as the real action's own shape.
+    """
+    samples = [
+        th.multinomial(cat.probs, num_samples=1, replacement=True, generator=generator).squeeze(-1)
+        for cat in distribution.distribution
+    ]
+    return th.stack(samples, dim=1)
+
+
 class PPOWithPDS(PPO):
     def __init__(self, policy=PDSActorCriticPolicy, env=None, pds_net_arch: list = None,
-                 ve_enabled: bool = False, ve_batch_size: int = 0, ve_period: int = 10, **kwargs):
+                 ve_enabled: bool = False, ve_batch_size: int = 0, ve_period: int = 10,
+                 pds_two_pass: bool = False, **kwargs):
         assert policy is PDSActorCriticPolicy, (
             "PPOWithPDS always uses PDSActorCriticPolicy - it's not a swappable "
             "policy= argument like stock PPO's (needed so predict_pds_values() exists)"
@@ -68,6 +92,36 @@ class PPOWithPDS(PPO):
         if self.ve_enabled:
             assert self.ve_batch_size > 0, "ve_enabled=True requires ve_batch_size > 0"
             assert self.ve_period > 0, "ve_period must be positive"
+
+        # Whether train() uses the two-pass structure (separate gradient-
+        # clip norm and independent minibatch shuffle for the PDS critic,
+        # vs one combined loss/backward/clip/step shared with the actor).
+        # ve_enabled FORCES this True regardless of pds_two_pass's own
+        # value - combining VE's pooled real+virtual gradient into a
+        # single clip norm with the actor is the exact contamination risk
+        # the split exists to prevent, so it can't be turned off with VE
+        # on. With VE off, pds_two_pass is a genuinely independent,
+        # experimentable choice: does the training-PROCEDURE change alone
+        # (not virtual data) affect results? Both structures apply the
+        # same vf_coef weighting to the PDS-critic loss either way (see
+        # _train_pds_critic/_train_policy_and_value) - the two-pass
+        # structure's only remaining, deliberate difference from the
+        # combined one is the separate clip norm and independent shuffle.
+        self.pds_two_pass_training = self.ve_enabled or bool(pds_two_pass)
+
+        # Dedicated RNG stream for VE's hypothetical-action sampling -
+        # NEVER touches torch's default/global generator that the real
+        # action sequence depends on, so there is nothing to snapshot/
+        # restore and no possibility of a later real draw reusing bits a
+        # virtual draw already consumed (a real, if narrow, correlation
+        # risk with the snapshot/restore approach this replaces).
+        # Reproducible per-run (offset from self.seed, distinct from it)
+        # when a seed is given; OS-entropy-seeded otherwise, matching
+        # self.seed's own None-means-unseeded convention.
+        ve_seed = None if self.seed is None else (self.seed + 1_000_003)
+        self._ve_generator = th.Generator(device=self.device)
+        if ve_seed is not None:
+            self._ve_generator.manual_seed(ve_seed)
 
     def collect_rollouts(self, env, callback, rollout_buffer, n_rollout_steps) -> bool:
         assert self._last_obs is not None, "No previous observation was provided"
@@ -131,22 +185,23 @@ class PPOWithPDS(PPO):
                 # PDSActorCriticPolicy, which overrides neither forward()
                 # nor _get_action_dist_from_latent()) - so drawing more
                 # samples from it costs zero extra actor forward passes.
-                # MUST happen before any other policy call, since the
-                # distribution is mutable and gets reconfigured by the
-                # next one. RNG snapshot/restore keeps these extra draws
-                # from perturbing the real action sequence: verified
-                # (ad-hoc test, not yet a committed test file) that a
+                # Drawn via self._ve_generator, a dedicated RNG stream
+                # (see __init__) that never touches torch's default
+                # generator the real action sequence depends on - so
+                # there is nothing to snapshot/restore, and no later real
+                # draw can ever reuse bits a virtual draw already
+                # consumed (a real, if narrow, risk with an earlier
+                # snapshot/restore version of this code). Verified: a
                 # frozen policy given the same seed produces bit-identical
-                # actions/values/log_probs on the NEXT call whether or not
-                # VE sampling happened in between.
+                # actions/values/log_probs whether or not VE sampling
+                # happens in between, at both single-call and full
+                # multi-hundred-step-rollout scale.
                 virtual_actions_np = None
                 if ve_triggered:
-                    rng_state = th.get_rng_state()
                     virtual_actions = [
-                        self.policy.action_dist.get_actions(deterministic=False)
+                        _sample_multicategorical(self.policy.action_dist, self._ve_generator)
                         for _ in range(self.ve_batch_size)
                     ]
-                    th.set_rng_state(rng_state)
                     # (ve_batch_size, n_envs, action_dim) -> per-branch numpy arrays
                     virtual_actions_np = th.stack(virtual_actions, dim=0).cpu().numpy()
             actions = actions.cpu().numpy()
@@ -216,10 +271,11 @@ class PPOWithPDS(PPO):
                 )
 
             if ve_triggered:
-                pds_obs_v, returns_v = self._build_virtual_pairs(
+                pds_obs_v, returns_v, ve_stats = self._build_virtual_pairs(
                     env, infos, terminateds, mu_d, mu_p, mu_b, virtual_actions_np,
                 )
                 rollout_buffer.add_virtual_pairs(pds_obs_v, returns_v)
+                rollout_buffer.add_ve_sample_stats(*ve_stats)
 
             rollout_buffer.add(
                 self._last_obs, actions, rewards, self._last_episode_starts, values, log_probs,
@@ -252,9 +308,14 @@ class PPOWithPDS(PPO):
         valid). self._last_obs is still the PRE-step observation here
         (collect_rollouts reassigns it to new_obs only after this call).
 
-        Returns (pds_obs_batch, returns_batch), flattened across
+        Returns (pds_obs_batch, returns_batch, ve_stats), flattened across
         (env, branch) in that nesting order - shape
         (n_envs*ve_batch_size, PDS_OBS_DIM) / (n_envs*ve_batch_size,).
+        ve_stats = (n_branches_total, n_unique_total, n_match_real_total),
+        summed across every env this call - "how much of the B_VE draws
+        is actually new information, once mandatory tiles collapse some
+        of them onto the same effective tile_mask" (including collapsing
+        onto the real executed action itself).
         """
         n_envs = env.num_envs
         n_branches = self.ve_batch_size
@@ -263,6 +324,9 @@ class PPOWithPDS(PPO):
         raw_next_states = np.zeros((n_total, 4), dtype=np.float32)
         tile_masks = np.zeros((n_total, config.N_TILES), dtype=np.float32)
         r_random_batch = np.zeros(n_total, dtype=np.float32)
+
+        n_unique_total = 0
+        n_match_real_total = 0
 
         k = 0
         for env_idx in range(n_envs):
@@ -274,6 +338,7 @@ class PPOWithPDS(PPO):
             # rather than adding yet another info field for it.
             delta_theta_t = abs(info["actual_theta"] - info["predicted_theta"])
             delta_phi_t = abs(info["actual_phi"] - info["predicted_phi"])
+            k_env_start = k
             for b in range(n_branches):
                 agent_tile_mask_b, power_watts_b = pds.unpack_action(virtual_actions_np[b, env_idx])
                 phys = pds.compute_virtual_branch_physics(
@@ -291,6 +356,16 @@ class PPOWithPDS(PPO):
                 tile_masks[k] = phys["tile_mask_b"].astype(np.float32)
                 r_random_batch[k] = phys["r_random_b"]
                 k += 1
+
+            # Duplicate bookkeeping for THIS env's n_branches slice, post-
+            # mandatory-OR (matches what actually enters training, not the
+            # raw pre-mandatory agent picks) - packed to hashable rows via
+            # np.packbits so set() can dedupe them cheaply.
+            env_masks = tile_masks[k_env_start:k].astype(bool)
+            packed = [np.packbits(row).tobytes() for row in env_masks]
+            n_unique_total += len(set(packed))
+            real_mask_packed = np.packbits(info["tile_mask"].astype(bool)).tobytes()
+            n_match_real_total += sum(1 for p in packed if p == real_mask_packed)
 
         # One batched normalize_obs() call over all n_envs*ve_batch_size
         # branches (not one per branch) - VecNormalize.normalize_obs() is
@@ -332,18 +407,12 @@ class PPOWithPDS(PPO):
         v_old_batch = np.where(terminated_per_branch, 0.0, v_old_batch)
 
         returns_batch = r_random_batch + self.gamma * v_old_batch
-        return pds_obs_batch.astype(np.float32), returns_batch.astype(np.float32)
+        ve_stats = (n_total, n_unique_total, n_match_real_total)
+        return pds_obs_batch.astype(np.float32), returns_batch.astype(np.float32), ve_stats
 
     def train(self) -> None:
         self.policy.set_training_mode(True)
         self._update_learning_rate(self.policy.optimizer)
-        clip_range = self.clip_range(self._current_progress_remaining)
-        if self.clip_range_vf is not None:
-            clip_range_vf = self.clip_range_vf(self._current_progress_remaining)
-
-        entropy_losses = []
-        pg_losses, ordinary_value_losses = [], []
-        clip_fractions = []
 
         # Snapshot the real PDS pairs in flat (N, dim)/(N,) form NOW, before
         # Pass 1's rollout_buffer.get() call below flattens
@@ -365,19 +434,109 @@ class PPOWithPDS(PPO):
             self.rollout_buffer.swap_and_flatten(self.rollout_buffer.pds_returns)
         ).flatten()
 
-        # --- Pass 1: actor + ordinary critic V, real rollout data only ---
-        # (v3 Algorithm 2 line 21: "update pi_theta, V on real rollout
-        # data"). The PDS critic Vtilde is trained entirely separately
-        # below (Pass 2) - deliberately NOT folded into this same loss/
-        # backward pass. zero_grad() immediately before every backward()
-        # (unchanged from before VE) means clip_grad_norm_ below only
-        # ever sees gradients from THIS pass's own loss, regardless of
-        # whether it's scoped to self.policy.parameters() or narrower -
-        # this is what keeps Pass 2's (possibly larger, real+virtual-
-        # pooled) PDS critic gradient from silently shrinking the actor's
-        # clipped step via a shared global norm, a real risk that was
-        # flagged and is resolved by this per-pass zero_grad discipline,
-        # not by the two losses having separate parameters alone.
+        # self.pds_two_pass_training selects the structure (see __init__
+        # for exactly what differs and why VE forces this True). False
+        # reproduces the original single-combined-pass formula exactly -
+        # verified bit-for-bit against an independently-reconstructed
+        # copy of that formula, from the same starting weights AND
+        # optimizer momentum state (that path's PDS-critic loss IS
+        # vf_coef-weighted, matching Exp1's real formula). True is also
+        # available WITHOUT VE (pds_two_pass=True, ve_enabled=False) as a
+        # deliberate, standalone experiment: does the separate-clip-norm/
+        # independent-shuffle structure alone change results, apart from
+        # virtual data? That path's PDS-critic loss is deliberately
+        # UNWEIGHTED (see _train_pds_critic's docstring) - matches every
+        # two-pass run already collected, past and future, on one
+        # consistent procedure, rather than the single-pass default's
+        # weighting.
+        if self.pds_two_pass_training:
+            pass1 = self._train_policy_and_value(include_pds_loss=False)
+            pass2 = self._train_pds_critic(real_pds_obs, real_pds_returns)
+        else:
+            pass1 = self._train_policy_and_value(include_pds_loss=True)
+            pass2 = {"pds_value_losses": pass1["pds_value_losses"], "n_virtual": 0, "n_pooled": 0}
+
+        explained_var = explained_variance(
+            self.rollout_buffer.values.flatten(), self.rollout_buffer.ordinary_returns.flatten()
+        )
+
+        self.logger.record("train/entropy_loss", np.mean(pass1["entropy_losses"]))
+        self.logger.record("train/policy_gradient_loss", np.mean(pass1["pg_losses"]))
+        self.logger.record("train/value_loss", np.mean(pass1["ordinary_value_losses"]))
+        self.logger.record("train/pds_value_loss", np.mean(pass2["pds_value_losses"]))
+        self.logger.record("train/approx_kl", np.mean(pass1["approx_kl_divs"]))
+        self.logger.record("train/clip_fraction", np.mean(pass1["clip_fractions"]))
+        self.logger.record("train/loss", pass1["last_loss"])
+        self.logger.record("train/explained_variance", explained_var)
+        self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
+        if self.ve_enabled:
+            self.logger.record("ve/n_virtual_pairs", pass2["n_virtual"])
+            self.logger.record(
+                "ve/virtual_fraction", pass2["n_virtual"] / pass2["n_pooled"] if pass2["n_pooled"] else 0.0
+            )
+            # How much of ve_batch_size draws is actually new information,
+            # once mandatory tiles are OR'd in - pooled (not averaged-of-
+            # averages) across every env/VE-event this rollout. Directly
+            # informs whether a larger ve_batch_size is worth its extra
+            # compute: unique_fraction near 1.0 means draws rarely
+            # collapse onto each other; match_real_fraction is how often a
+            # draw collapses onto the real executed action specifically
+            # (those add zero new (state, target) pairs beyond what the
+            # real step already contributes).
+            ve_dup = self.rollout_buffer.get_ve_duplicate_summary()
+            self.logger.record("ve/unique_fraction", ve_dup["unique_fraction"])
+            self.logger.record("ve/match_real_fraction", ve_dup["match_real_fraction"])
+        self.logger.record("train/clip_range", pass1["clip_range"])
+        if pass1["clip_range_vf"] is not None:
+            self.logger.record("train/clip_range_vf", pass1["clip_range_vf"])
+
+        # PDS variance-reduction evidence (PDSRolloutBuffer._compute_variance_diagnostics):
+        # is delta_pds actually lower-variance than the ordinary TD residual
+        # on the same rollout? Recorded on EVERY train() call from rollout 1
+        # so SB3's CSVOutputFormat never has to rewrite progress.csv for a
+        # newly-appearing key mid-run. The plain-PPO baseline never reaches
+        # this code path (it uses stock PPO.train()), so no shared-key
+        # coupling between the two methods.
+        for name, val in self.rollout_buffer.last_diagnostics.items():
+            self.logger.record(f"pds_diag/{name}", val)
+
+    def _train_policy_and_value(self, include_pds_loss: bool) -> dict:
+        """Actor + ordinary critic V, real rollout data only (v3 Algorithm
+        2 line 21: "update pi_theta, V on real rollout data").
+
+        include_pds_loss selects between the two training procedures:
+        - False (VE enabled): the PDS critic Vtilde is trained entirely
+          separately (_train_pds_critic), deliberately NOT folded into
+          this loss/backward pass. zero_grad() immediately before every
+          backward() means clip_grad_norm_ below only ever sees
+          gradients from THIS pass's own loss - this is what keeps Pass
+          2's (real+virtual-pooled) PDS critic gradient from silently
+          shrinking the actor's clipped step via a shared global norm.
+          Separately verified (test, not just this reasoning): actor/
+          ordinary-critic parameters are bit-for-bit unchanged by a
+          _train_pds_critic()-only call, and vice versa.
+        - True (VE disabled): reproduces the ORIGINAL, pre-VE single-
+          combined-pass formula exactly - loss = policy_loss +
+          ent_coef*entropy_loss + vf_coef*(ordinary_value_loss +
+          pds_value_loss), one zero_grad/backward/clip/step per
+          minibatch, PDS critic interleaved with the actor using the
+          SAME minibatch shuffle. This matters: without virtual data,
+          there is no reason to split the pass at all, and splitting it
+          unconditionally would silently make every VE-disabled run a
+          DIFFERENT training procedure than the original PDS-only code
+          (separate clip norm, PDS loss missing its vf_coef weighting,
+          independent Pass-2 shuffling) - not a clean ablation baseline.
+        """
+        clip_range = self.clip_range(self._current_progress_remaining)
+        clip_range_vf = self.clip_range_vf(self._current_progress_remaining) if self.clip_range_vf is not None else None
+
+        entropy_losses = []
+        pg_losses, ordinary_value_losses = [], []
+        pds_value_losses = [] if include_pds_loss else None
+        clip_fractions = []
+        approx_kl_divs = []
+        last_loss = None
+
         continue_training = True
         for epoch in range(self.n_epochs):
             approx_kl_divs = []
@@ -422,6 +581,12 @@ class PPOWithPDS(PPO):
 
                 loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * ordinary_value_loss
 
+                if include_pds_loss:
+                    pds_values = self.policy.predict_pds_values(rollout_data.pds_observations).flatten()
+                    pds_value_loss = F.mse_loss(rollout_data.pds_returns, pds_values)
+                    pds_value_losses.append(pds_value_loss.item())
+                    loss = loss + self.vf_coef * pds_value_loss
+
                 with th.no_grad():
                     log_ratio = log_prob - rollout_data.old_log_prob
                     approx_kl_div = th.mean((th.exp(log_ratio) - 1) - log_ratio).cpu().numpy()
@@ -437,24 +602,44 @@ class PPOWithPDS(PPO):
                 loss.backward()
                 th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
                 self.policy.optimizer.step()
+                last_loss = loss.item()
 
             self._n_updates += 1
             if not continue_training:
                 break
 
-        # --- Pass 2: PDS critic Vtilde, pooled real+virtual pairs ---
-        # (v3 Algorithm 2 line 22: "Fit Vtilde on all real and virtual PDS
-        # pairs from this rollout"). Real pairs come from the SAME
-        # rollout_buffer (flattened across buffer_size*n_envs, exactly
-        # what rollout_data.pds_observations/pds_returns drew from in the
-        # pre-VE code); virtual pairs (possibly none, if VE is disabled
-        # or no VE event fired) come from get_virtual_pairs(). Pooled and
-        # shuffled BEFORE minibatching, so F.mse_loss's per-minibatch mean
-        # weights every pair - real or virtual - equally; no separate
-        # virtual-loss coefficient. Runs for the same self.n_epochs, but
-        # as its own independent shuffle/minibatch loop - a virtual pair
-        # is never required to land in the same minibatch as the real
-        # step it came from.
+        return {
+            "entropy_losses": entropy_losses, "pg_losses": pg_losses,
+            "ordinary_value_losses": ordinary_value_losses, "clip_fractions": clip_fractions,
+            "approx_kl_divs": approx_kl_divs, "last_loss": last_loss,
+            "clip_range": clip_range, "clip_range_vf": clip_range_vf,
+            "pds_value_losses": pds_value_losses,
+        }
+
+    def _train_pds_critic(self, real_pds_obs: th.Tensor, real_pds_returns: th.Tensor) -> dict:
+        """Pass 2: PDS critic Vtilde, pooled real+virtual pairs (v3
+        Algorithm 2 line 22: "Fit Vtilde on all real and virtual PDS pairs
+        from this rollout"). real_pds_obs/real_pds_returns are the SAME
+        rollout's real pairs, already flattened by train() before Pass 1
+        touched the buffer's internal state; virtual pairs (possibly
+        none, if VE is disabled or no VE event fired) come from
+        get_virtual_pairs(). Pooled and shuffled BEFORE minibatching, so
+        F.mse_loss's per-minibatch mean weights every pair - real or
+        virtual - equally; no separate virtual-loss coefficient. Runs for
+        the same self.n_epochs, but as its own independent shuffle/
+        minibatch loop - a virtual pair is never required to land in the
+        same minibatch as the real step it came from. Never touches the
+        actor or ordinary critic's loss - see _train_policy_and_value's
+        docstring for why a shared optimizer/zero_grad discipline still
+        keeps this pass from perturbing them. UNWEIGHTED (no vf_coef) by
+        explicit choice, matching the already-running two-pass arms
+        exactly (both the 3 no-VE "new PDS" controls and the 12 VE arms
+        use weight 1 here) - a deliberate decision to keep every
+        two-pass run, past and future, on one consistent procedure,
+        rather than "fixing" this to match the single-pass default's
+        0.5 weighting (which stays as-is, since it's reproducing Exp1's
+        actual original formula, not this one).
+        """
         virtual_pds_obs, virtual_pds_returns = self.rollout_buffer.get_virtual_pairs()
 
         if virtual_pds_obs is not None:
@@ -479,32 +664,4 @@ class PPOWithPDS(PPO):
                 th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
                 self.policy.optimizer.step()
 
-        explained_var = explained_variance(
-            self.rollout_buffer.values.flatten(), self.rollout_buffer.ordinary_returns.flatten()
-        )
-
-        self.logger.record("train/entropy_loss", np.mean(entropy_losses))
-        self.logger.record("train/policy_gradient_loss", np.mean(pg_losses))
-        self.logger.record("train/value_loss", np.mean(ordinary_value_losses))
-        self.logger.record("train/pds_value_loss", np.mean(pds_value_losses))
-        self.logger.record("train/approx_kl", np.mean(approx_kl_divs))
-        self.logger.record("train/clip_fraction", np.mean(clip_fractions))
-        self.logger.record("train/loss", loss.item())
-        self.logger.record("train/explained_variance", explained_var)
-        self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
-        if self.ve_enabled:
-            self.logger.record("ve/n_virtual_pairs", n_virtual)
-            self.logger.record("ve/virtual_fraction", n_virtual / n_pooled if n_pooled else 0.0)
-        self.logger.record("train/clip_range", clip_range)
-
-        # PDS variance-reduction evidence (PDSRolloutBuffer._compute_variance_diagnostics):
-        # is delta_pds actually lower-variance than the ordinary TD residual
-        # on the same rollout? Recorded on EVERY train() call from rollout 1
-        # so SB3's CSVOutputFormat never has to rewrite progress.csv for a
-        # newly-appearing key mid-run. The plain-PPO baseline never reaches
-        # this code path (it uses stock PPO.train()), so no shared-key
-        # coupling between the two methods.
-        for name, val in self.rollout_buffer.last_diagnostics.items():
-            self.logger.record(f"pds_diag/{name}", val)
-        if self.clip_range_vf is not None:
-            self.logger.record("train/clip_range_vf", clip_range_vf)
+        return {"pds_value_losses": pds_value_losses, "n_virtual": n_virtual, "n_pooled": n_pooled}

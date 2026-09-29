@@ -66,6 +66,15 @@ class PDSRolloutBuffer(RolloutBuffer):
         # ve_batch_size=0) is a completely valid, common state.
         self._virtual_pds_observations: list = []
         self._virtual_pds_returns: list = []
+        # Per-(env, VE-event) sampling diagnostics - how much information
+        # ve_batch_size draws actually carry, after mandatory tiles are
+        # OR'd in (which can collapse otherwise-distinct raw picks onto
+        # the same effective tile_mask). Raw counts, not fractions, so
+        # get_ve_duplicate_summary() can pool correctly across events with
+        # different branch counts rather than averaging averages.
+        self._ve_n_branches_total = 0
+        self._ve_n_unique_total = 0
+        self._ve_n_match_real_total = 0
 
     def add(
         self,
@@ -111,6 +120,29 @@ class PDSRolloutBuffer(RolloutBuffer):
         obs = np.concatenate(self._virtual_pds_observations, axis=0)
         returns = np.concatenate(self._virtual_pds_returns, axis=0)
         return self.to_torch(obs), self.to_torch(returns)
+
+    def add_ve_sample_stats(self, n_branches: int, n_unique: int, n_match_real: int) -> None:
+        """Record one env's worth of hypothetical-action duplicate
+        bookkeeping for a single VE event: n_branches sampled, n_unique
+        distinct tile_masks among them (post-mandatory-OR), n_match_real
+        of those that equal the real executed action's own tile_mask.
+        Called once per env per VE event from PPOWithPDS._build_virtual_pairs."""
+        self._ve_n_branches_total += n_branches
+        self._ve_n_unique_total += n_unique
+        self._ve_n_match_real_total += n_match_real
+
+    def get_ve_duplicate_summary(self) -> dict:
+        """Pooled (not averaged-of-averages) duplicate-rate summary across
+        every env/VE-event this rollout - empty-safe (VE disabled, or no
+        VE event fired, both leave the totals at 0)."""
+        n = self._ve_n_branches_total
+        if n == 0:
+            return {"unique_fraction": float("nan"), "match_real_fraction": float("nan"), "n_branches_total": 0}
+        return {
+            "unique_fraction": self._ve_n_unique_total / n,
+            "match_real_fraction": self._ve_n_match_real_total / n,
+            "n_branches_total": n,
+        }
 
     def compute_pds_returns_and_advantage(self, policy, last_values: th.Tensor, gae_lambda: float) -> None:
         """Phase B of the PPO+PDS pseudocode. Must be called once, after the

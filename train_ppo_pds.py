@@ -98,6 +98,21 @@ def parse_args():
     p.add_argument("--ve-period", type=int, default=10,
                     help="T: VE event every T rollout-local steps (0-indexed, matches v3 Algorithm 2's "
                          "own t - i.e. t=0,T,2T,... within each rollout, not a continuous run-wide counter)")
+    # Structural ablation, INDEPENDENT of VE: with --ve-enabled, the PDS
+    # critic always trains in a separate pass (its own gradient-clip norm,
+    # its own minibatch shuffle) - required, not optional, since pooled
+    # real+virtual data can inflate its gradient enough to matter for a
+    # shared clip norm with the actor. Without --ve-enabled, this flag
+    # lets that SAME two-pass structure run on real data alone, isolating
+    # whether the structure itself (not virtual data) changes results -
+    # e.g. the separate clip norm no longer letting a large PDS-critic
+    # gradient shrink the actor's step. Default off reproduces the
+    # original single-combined-pass PDS formula exactly (verified
+    # bit-for-bit against an independent reconstruction of it).
+    p.add_argument("--pds-two-pass", action="store_true",
+                    help="train the PDS critic in its own separate pass (own clip norm, own shuffle) "
+                         "even without VE, to isolate the training-PROCEDURE change from virtual data "
+                         "(default off = original single-pass PDS formula, exact match to Exp1)")
     p.add_argument("--log-dir", type=str, default="runs/ppo_pds_run")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--resume-from", type=str, default=None,
@@ -145,12 +160,13 @@ def main():
                             gae_lambda=args.gae_lambda, ent_coef=ent_coef,
                             clip_range_vf=args.clip_range_vf, seed=args.seed,
                             ve_enabled=args.ve_enabled, ve_batch_size=args.ve_batch_size,
-                            ve_period=args.ve_period,
+                            ve_period=args.ve_period, pds_two_pass=args.pds_two_pass,
                             verbose=1, device=args.device)
         print(f"Fresh start: d_bar={d_bar} p_bar={p_bar} b_bar={b_bar} ent_coef={ent_coef} "
               f"gae_lambda={args.gae_lambda} clip_range_vf={args.clip_range_vf} "
               f"pds_critic_architecture={config.PDS_CRITIC_ARCHITECTURE} "
-              f"ve_enabled={args.ve_enabled} ve_batch_size={args.ve_batch_size} ve_period={args.ve_period}")
+              f"ve_enabled={args.ve_enabled} ve_batch_size={args.ve_batch_size} ve_period={args.ve_period} "
+              f"pds_two_pass_training={model.pds_two_pass_training}")
     model.set_logger(sb3_configure(args.log_dir, ["stdout", "csv"]))
 
     callbacks = [
