@@ -113,6 +113,17 @@ def parse_args():
                     help="train the PDS critic in its own separate pass (own clip norm, own shuffle) "
                          "even without VE, to isolate the training-PROCEDURE change from virtual data "
                          "(default off = original single-pass PDS formula, exact match to Exp1)")
+    # "Old PDS + VE": explicit override that folds VE's pooled real+virtual
+    # pairs into the SAME single combined pass as the actor/V (the
+    # single-pass PDS formula, unchanged in structure) instead of the
+    # normally-forced two-pass split - answers "does VE help the already-
+    # working single-pass procedure" directly, at the deliberate cost of
+    # reopening the shared-clip-norm risk the two-pass split exists to
+    # prevent. Only meaningful with --ve-enabled; ignored otherwise.
+    p.add_argument("--ve-shared-pass", action="store_true",
+                    help="fold VE's pooled real+virtual pairs into the single combined pass instead of "
+                         "the (normally forced) two-pass split - the 'old PDS + VE' experiment; requires "
+                         "--ve-enabled, ignored without it")
     p.add_argument("--log-dir", type=str, default="runs/ppo_pds_run")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--resume-from", type=str, default=None,
@@ -161,12 +172,13 @@ def main():
                             clip_range_vf=args.clip_range_vf, seed=args.seed,
                             ve_enabled=args.ve_enabled, ve_batch_size=args.ve_batch_size,
                             ve_period=args.ve_period, pds_two_pass=args.pds_two_pass,
+                            ve_shared_pass=args.ve_shared_pass,
                             verbose=1, device=args.device)
         print(f"Fresh start: d_bar={d_bar} p_bar={p_bar} b_bar={b_bar} ent_coef={ent_coef} "
               f"gae_lambda={args.gae_lambda} clip_range_vf={args.clip_range_vf} "
               f"pds_critic_architecture={config.PDS_CRITIC_ARCHITECTURE} "
               f"ve_enabled={args.ve_enabled} ve_batch_size={args.ve_batch_size} ve_period={args.ve_period} "
-              f"pds_two_pass_training={model.pds_two_pass_training}")
+              f"pds_two_pass_training={model.pds_two_pass_training} ve_shared_pass={model.ve_shared_pass}")
     model.set_logger(sb3_configure(args.log_dir, ["stdout", "csv"]))
 
     callbacks = [

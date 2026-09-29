@@ -175,7 +175,7 @@ After the action, $\mathcal{E}^t$, $A^t$, $R^t$, $D^t$, and $\Zt^{t+1}$ are know
 \end{equation}
 a 68-dimensional vector (four scalars and a 64-bit mask), and $\om^{t+1}=(\Zt^{t+1},\Delta_\theta^t,\Delta_\phi^t,h^{t+1})$. The reward splits exactly (verified on every step to within $10^{-6}$) as
 \begin{equation}
-r^t=\rk^t+\rr^t,\qquad \rk^t=-\textstyle\sum_{j}\mu_jc_j^t,\qquad \rr^t=\beta_q\Ccov^t.
+r^t=\underbrace{-\textstyle\sum_{j\in\Cset}\mu_jc_j^t}_{\rk^t}\;+\;\underbrace{\beta_q\Ccov^t}_{\rr^t}.
 \label{eq:split}
 \end{equation}
 
@@ -290,12 +290,15 @@ We use the \emph{Runner} sequence and its head-movement traces from the full-UHD
 \begin{tabular}{@{}ll@{}}
 \toprule
 Tiles, FoV & $N=64$ ($8\times8$), $120^\circ\times60^\circ$ viewport, $H=36$ slots\\
-Channel~\cite{chakareski2025mmsp} & $P_{\max}=20$\,dBm, $W=10$\,MHz, $N_0=-174$\,dBm/Hz, $d=50$\,m, $\nu=12$\,dB\\
-PPO & $\gamma=0.99$, $\lambda=0.95$, lr $3{\times}10^{-4}$, $n_{\mathrm{steps}}=1728$ ($N_{\mathrm{ep}}=48$),\\
- & batch 64, $K=10$, $\epsilon=0.2$, $c_v=0.5$, entropy coefficient 0\\
+Channel & $P_{\max}=20$\,dBm, $W=10$\,MHz, $N_0=-174$\,dBm/Hz,\\
+ & $d=50$\,m, $\nu=12$\,dB~\cite{chakareski2025mmsp}\\
+PPO & $\gamma=0.99$, $\lambda=0.95$, lr $3{\times}10^{-4}$, $n_{\mathrm{steps}}=1728$,\\
+ & $N_{\mathrm{ep}}=48$, batch 64, $K=10$, $\epsilon=0.2$, $c_v=0.5$,\\
+ & entropy coefficient 0\\
 Networks & $\pi_\theta,V_\phi$: MLP $[64,64]$; $\Vt_\psi$: MLP $[96,64]$ (tanh)\\
 Lagrangian & $\eta_\mu=2.5{\times}10^{-3}$, $\mu_j^0=1$, $\beta_q=1$\\
-Budgets & A: $(\bar D,\bar B)=(0.3,8)$; B: $(0.1,8)$ \quad VE: $\BVE=8$, $T=10$\\
+Budgets & A: $(\bar D,\bar B)=(0.3,8)$; B: $(0.1,8)$\\
+VE & $\BVE=8$, $T=10$\\
 \bottomrule
 \end{tabular}
 \end{table}
