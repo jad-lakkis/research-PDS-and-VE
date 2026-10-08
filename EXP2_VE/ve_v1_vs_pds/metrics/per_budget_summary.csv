@@ -1,3 +1,0 @@
-budget,n_seeds,rollouts_compared_min,rollouts_compared_max,VE_v1_violation_now_mean,PDS_exp1_violation_now_mean,VE_v1_violation_now_median,PDS_exp1_violation_now_median,VE_v1_seeds_reached_zero,PDS_exp1_seeds_reached_zero,VE_v1_seeds_feasible_ge50pct,PDS_exp1_seeds_feasible_ge50pct,VE_better,VE_mixed,VE_worse,VE_tie
-A,6,1503,1608,0.1576,0.0482,0.1785,0.029,3,4,0,2,0,1,5,0
-B,4,1350,1437,0.1655,0.0659,0.1594,0.0336,2,3,2,2,1,1,2,0

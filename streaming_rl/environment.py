@@ -46,6 +46,35 @@ array. The first N_TILES entries are each in {0,1} (x^t_i - enhance
 tile i or not, before the mandatory-viewport OR above is applied). The
 last entry is in {0, ..., N_POWER_LEVELS-1} and selects a linearly-
 spaced power level between 0 and P_max (watts).
+
+Link model (constructor argument "link"):
+  "rician" (default) - R^t = W log2(1 + P^t h^t / (W N0)), h^t sampled
+    i.i.d. each step (channel_model). Everything above, unchanged.
+  "lumos5g" - R^t is MEASURED throughput (streaming_rl/lumos5g.py; each
+    episode is a contiguous 36-s window of one Lumos5G run, drawn uniformly
+    over every (run, start second) of the chosen split, or fixed through
+    reset(options={"window": (run, start)})). Power cannot change a
+    measured rate, so it is fixed (config.FIXED_POWER_WATTS) and the action
+    is the N_TILES tile bits alone. The buffer/stall/coverage equations are
+    unchanged - they only use R^t. Observation:
+    (Z^t, Delta_theta^{t-1}, Delta_phi^{t-1}, R^t, R^{t-1}, ..., R^{t-5})
+    with Z and R in Mbit(/s); R^t is known before the decision, exactly
+    as h^t is in the rician model.
+
+Tile frame (constructor argument "tile_frame"):
+  "absolute" (default) - action bit i is physical tile i. Everything above.
+  "relative" - the agent's tile bits are in viewport-relative coordinates
+    (streaming_rl/tile_frame.py): rows physical, columns counted from the
+    PREDICTED viewport's column. step() maps them to physical tiles (a
+    cyclic column shift fixed by the prediction) before anything else, so
+    transmitted tiles, buffer, stall, reward and constraints are computed on
+    physical tiles exactly as before. The observation carries the viewing
+    context the relative bits need:
+    (Z^t, signed last head move dtheta, dphi, predicted elevation phi_hat,
+     predicted azimuth's offset inside its tile column, sin/cos of the
+     predicted azimuth theta_hat, video time t/T, link part)
+    with link part = R^t, ..., R^{t-5} (Lumos5G, 14 numbers in total) or
+    h^t (rician, 9 in total).
 """
 
 import numpy as np
@@ -53,7 +82,7 @@ import gymnasium as gym
 from gymnasium import spaces
 
 import config
-from streaming_rl import data_loader, channel_model, layer_model, viewport
+from streaming_rl import data_loader, channel_model, layer_model, lumos5g, tile_frame, viewport
 from streaming_rl import pds as pds_module
 
 
@@ -61,7 +90,8 @@ class TileStreamingEnv(gym.Env):
     metadata = {"render_modes": []}
 
     def __init__(self, enhanced_level: int = None, trace_indices: list = None, bundle: dict = None,
-                 log_counterfactual: bool = False):
+                 log_counterfactual: bool = False, link: str = "rician", lumos_split: str = "train",
+                 lumos_scale: float = 1.0, lumos_data: dict = None, tile_frame: str = "absolute"):
         super().__init__()
 
         # Eval-only diagnostic: when True, step() additionally reports what
@@ -114,23 +144,61 @@ class TileStreamingEnv(gym.Env):
         self._valid_traces = all_traces if trace_indices is None else [all_traces[i] for i in trace_indices]
         assert len(self._valid_traces) > 0, f"no valid traces for trace_indices={trace_indices}"
 
-        # observation = (Z^t, Delta^{t-1}_theta, Delta^{t-1}_phi, h^t)
-        # Z and h are left unbounded above (>=0) - the formulation places
-        # no ceiling on either (eq. 15 only floors Z at 0; h has no
-        # stated upper bound). Delta is an absolute difference of two
-        # angles in [-180,180], so its max possible value is 360.
-        self.observation_space = spaces.Box(
-            low=np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float32),
-            high=np.array([np.inf, 360.0, 360.0, np.inf], dtype=np.float32),
-            dtype=np.float32,
-        )
+        assert link in ("rician", "lumos5g"), f"unknown link model {link!r}"
+        assert tile_frame in ("absolute", "relative"), f"unknown tile frame {tile_frame!r}"
+        self._link = link
+        self._tile_frame = tile_frame
+        if link == "lumos5g" or tile_frame == "relative":
+            # Every trace of a video has the same length (Runner: 1080 frames
+            # = 36 GOPs). Lumos5G windows are sized to it (plus one extra
+            # second for the terminal observation's R^{t+1}); the relative
+            # frame's observation reports video time as t / this.
+            self._ep_len = max(-(-len(tr) // config.GOP_SIZE_FRAMES) for _, tr in self._valid_traces)
+        if link == "lumos5g":
+            self._lumos = lumos_data if lumos_data is not None else lumos5g.load_bundle()
+            self._lumos_scale = float(lumos_scale)
+            self._n_hist = config.LUMOS5G_N_HISTORY
+            self._start_runs, self._start_secs = lumos5g.all_starts(
+                self._lumos["runs"], self._lumos["splits"][lumos_split], self._ep_len)
+            self._window = None
+            self._R = None
+            # observation = (Z^t, Delta^{t-1}_theta, Delta^{t-1}_phi, R^t, R^{t-1}, ..., R^{t-n_hist})
+            n_obs = 3 + 1 + self._n_hist
+            self.observation_space = spaces.Box(
+                low=np.zeros(n_obs, dtype=np.float32),
+                high=np.array([np.inf, 360.0, 360.0] + [np.inf] * (1 + self._n_hist), dtype=np.float32),
+                dtype=np.float32,
+            )
+            self.action_space = spaces.MultiDiscrete([2] * config.N_TILES)
+        else:
+            # observation = (Z^t, Delta^{t-1}_theta, Delta^{t-1}_phi, h^t)
+            # Z and h are left unbounded above (>=0) - the formulation places
+            # no ceiling on either (eq. 15 only floors Z at 0; h has no
+            # stated upper bound). Delta is an absolute difference of two
+            # angles in [-180,180], so its max possible value is 360.
+            self.observation_space = spaces.Box(
+                low=np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float32),
+                high=np.array([np.inf, 360.0, 360.0, np.inf], dtype=np.float32),
+                dtype=np.float32,
+            )
 
-        # Flat MultiDiscrete instead of a Dict/Tuple action space: SB3's
-        # PPO (the algorithm this project is heading toward) does not
-        # support Dict/Tuple *action* spaces natively, only Box/
-        # Discrete/MultiDiscrete/MultiBinary. A single MultiDiscrete
-        # keeps this compatible without redesigning later.
-        self.action_space = spaces.MultiDiscrete([2] * config.N_TILES + [config.N_POWER_LEVELS])
+            # Flat MultiDiscrete instead of a Dict/Tuple action space: SB3's
+            # PPO (the algorithm this project is heading toward) does not
+            # support Dict/Tuple *action* spaces natively, only Box/
+            # Discrete/MultiDiscrete/MultiBinary. A single MultiDiscrete
+            # keeps this compatible without redesigning later.
+            self.action_space = spaces.MultiDiscrete([2] * config.N_TILES + [config.N_POWER_LEVELS])
+
+        if tile_frame == "relative":
+            # (Z, dtheta, dphi, phi_hat, column offset, sin theta_hat, cos theta_hat, t/T) + link part;
+            # the action space is unchanged in size - only what each tile bit refers to changes
+            n_link = 1 + self._n_hist if link == "lumos5g" else 1
+            half = config.TILE_WIDTH_DEG / 2
+            self.observation_space = spaces.Box(
+                low=np.array([0.0, -180.0, -180.0, -90.0, -half, -1.0, -1.0, 0.0] + [0.0] * n_link, dtype=np.float32),
+                high=np.array([np.inf, 180.0, 180.0, 90.0, half, 1.0, 1.0, 1.0] + [np.inf] * n_link, dtype=np.float32),
+                dtype=np.float32,
+            )
 
         self._P_max_watts = channel_model.dbm_to_watts(config.P_MAX_DBM)
 
@@ -174,6 +242,30 @@ class TileStreamingEnv(gym.Env):
         # config.H_OBSERVATION_PRESCALE's comment / decision_log.md #15.
         return np.array([Z, delta_theta, delta_phi, h * config.H_OBSERVATION_PRESCALE], dtype=np.float32)
 
+    def _lumos_observation(self, Z, delta_theta, delta_phi, t) -> np.ndarray:
+        # self._R holds n_hist samples before the window, then the window:
+        # R^t is self._R[n_hist + t]; R^t, R^{t-1}, ..., R^{t-n_hist} is
+        # that slice reversed. Z/R scaled to Mbit(/s) here only - every
+        # physics quantity (info, buffer, stall) stays in bits.
+        s = config.LUMOS5G_OBS_SCALE
+        link = self._R[t:t + self._n_hist + 1][::-1] * s
+        return np.concatenate([[Z * s, delta_theta, delta_phi], link]).astype(np.float32)
+
+    def _relative_observation(self, Z, dtheta, dphi, pred_theta, pred_phi, t, h) -> np.ndarray:
+        # Viewing context for viewport-relative tile bits (see module docstring).
+        # dtheta/dphi are SIGNED (dtheta wrapped to [-180, 180)): the last head
+        # move = last actual - its prediction (the viewport before it).
+        if self._link == "lumos5g":
+            zs = config.LUMOS5G_OBS_SCALE
+            link = self._R[t:t + self._n_hist + 1][::-1] * zs
+        else:
+            zs = 1.0
+            link = [h * config.H_OBSERVATION_PRESCALE]
+        th = np.deg2rad(pred_theta)
+        view = [Z * zs, dtheta, dphi, pred_phi, tile_frame.column_offset_deg(pred_theta),
+                np.sin(th), np.cos(th), t / self._ep_len]
+        return np.concatenate([view, link]).astype(np.float32)
+
     # -- gymnasium API ------------------------------------------------------
 
     def reset(self, *, seed=None, options=None):
@@ -197,9 +289,21 @@ class TileStreamingEnv(gym.Env):
         delta_theta_prev = abs(actual_theta_0 - self._predicted_theta)  # == 0.0
         delta_phi_prev = abs(actual_phi_0 - self._predicted_phi)        # == 0.0
 
-        self._h = channel_model.sample_channel_gain(self.np_random_as_generator())
-
-        obs = self._observation(self._Z, delta_theta_prev, delta_phi_prev, self._h)
+        if self._link == "lumos5g":
+            window = (options or {}).get("window")
+            if window is None:
+                k = self.np_random.integers(0, len(self._start_runs))
+                window = (int(self._start_runs[k]), int(self._start_secs[k]))
+            self._window = (int(window[0]), int(window[1]))
+            self._R = lumos5g.rate_window(self._lumos["runs"], self._window[0], self._window[1],
+                                          self._ep_len + 1, self._lumos_scale, self._n_hist)
+            self._h = None
+            obs = self._lumos_observation(self._Z, delta_theta_prev, delta_phi_prev, 0)
+        else:
+            self._h = channel_model.sample_channel_gain(self.np_random_as_generator())
+            obs = self._observation(self._Z, delta_theta_prev, delta_phi_prev, self._h)
+        if self._tile_frame == "relative":
+            obs = self._relative_observation(self._Z, 0.0, 0.0, actual_theta_0, actual_phi_0, 0, self._h)
         info = {}
         return obs, info
 
@@ -233,6 +337,13 @@ class TileStreamingEnv(gym.Env):
         pred_theta_used = self._predicted_theta
         pred_phi_used = self._predicted_phi
 
+        # Relative tile frame: the agent's bits -> physical tiles, using the
+        # prediction known now. From here on everything is physical.
+        tile_shift = None
+        if self._tile_frame == "relative":
+            tile_shift = tile_frame.column_shift(pred_theta_used)
+            agent_tile_mask = tile_frame.rel_to_abs(agent_tile_mask, tile_shift)
+
         mandatory_tile_mask = viewport.mandatory_tile_mask(pred_theta_used, pred_phi_used)
         tile_mask = agent_tile_mask | mandatory_tile_mask
 
@@ -240,7 +351,10 @@ class TileStreamingEnv(gym.Env):
         a_result = layer_model.compute_A_t(self._rd_data, config.TRAINING_VIDEO_ARRAY_INDEX,
                                             t, tile_mask, enhanced_level=self._enhanced_level)
         A_t = a_result["A_t"]
-        R_t = channel_model.transmission_rate(power_watts, self._h)
+        if self._link == "lumos5g":
+            R_t = float(self._R[self._n_hist + t])   # measured, known before the decision
+        else:
+            R_t = channel_model.transmission_rate(power_watts, self._h)
 
         T0 = config.T0_SEC
         if self._Z + T0 * R_t >= A_t:
@@ -269,7 +383,7 @@ class TileStreamingEnv(gym.Env):
         r_t = r_known + r_random
 
         # --- prepare state for the NEXT step ---
-        h_next = channel_model.sample_channel_gain(self.np_random_as_generator())
+        h_next = None if self._link == "lumos5g" else channel_model.sample_channel_gain(self.np_random_as_generator())
         predicted_theta_next = actual_theta_t   # "last viewport as prediction"
         predicted_phi_next = actual_phi_t
 
@@ -298,7 +412,14 @@ class TileStreamingEnv(gym.Env):
         self._J_P += discount_pow_t * cost_P_t
         self._J_B += discount_pow_t * cost_B_t
 
-        obs = self._observation(Z_next, delta_theta_t, delta_phi_t, h_next)
+        if self._tile_frame == "relative":
+            obs = self._relative_observation(Z_next, tile_frame.wrap_deg(actual_theta_t - pred_theta_used),
+                                             actual_phi_t - pred_phi_used, predicted_theta_next,
+                                             predicted_phi_next, next_t, h_next)
+        elif self._link == "lumos5g":
+            obs = self._lumos_observation(Z_next, delta_theta_t, delta_phi_t, next_t)
+        else:
+            obs = self._observation(Z_next, delta_theta_t, delta_phi_t, h_next)
         info = {
             "A_t": A_t,
             "A_base": a_result["A_base"],
@@ -354,6 +475,22 @@ class TileStreamingEnv(gym.Env):
             "cost_P": cost_P_t,
             "cost_B": cost_B_t,
         }
+        if self._link == "lumos5g" or self._tile_frame == "relative":
+            # For virtual experience: every part of the next observation except
+            # Z (head move, next prediction, video time, link) is the same for
+            # every hypothetical branch - only its buffer differs.
+            info["next_obs_raw"] = obs.copy()
+            info["z_obs_scale"] = config.LUMOS5G_OBS_SCALE if self._link == "lumos5g" else 1.0
+        if self._link == "lumos5g":
+            # measured rate: the same for every hypothetical action
+            info["R_t_exogenous"] = R_t
+            info["lumos_window"] = self._window
+        if self._tile_frame == "relative":
+            # agent_tile_mask/tile_mask above are PHYSICAL; the PDS critic and
+            # virtual experience also need the shift and the executed mask in
+            # the agent's relative coordinates
+            info["tile_shift"] = tile_shift
+            info["tile_mask_rel"] = tile_frame.abs_to_rel(tile_mask, tile_shift).astype(np.uint8)
 
         # Eval-only counterfactual (see __init__'s log_counterfactual):
         # quality if ONLY the mandatory predicted-viewport tiles had been

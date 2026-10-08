@@ -22,17 +22,26 @@ highest J_Q. If none are feasible yet, keep the one with the smallest
 total normalized violation, J_Q as tiebreak. Mean Lagrangian reward is
 never used for selection - mu_D/mu_P/mu_B change during training, so
 it isn't comparable across checkpoints.
+
+Lumos5G link (link="lumos5g"): held-out viewers x config.LUMOS5G_EVAL_WINDOWS
+fixed validation-run windows. Outage stall that no policy can avoid
+differs between windows and between splits, so the stall budget is judged
+on the SAME episodes as "predicted viewport only" (computed once, at
+init): an episode's stall budget is its own viewport-only J_D plus the
+stall allowance, and the eval's D_bar is the mean of those.
 """
 
 import csv
 import os
 from dataclasses import dataclass
+from itertools import product
 
 import numpy as np
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.vec_env import VecNormalize
 
 import config
+from streaming_rl import lumos5g
 from streaming_rl.environment import TileStreamingEnv
 
 
@@ -186,7 +195,7 @@ class EpisodeResult:
 
 
 def run_eval_episode(env: TileStreamingEnv, model, vecnormalize, seed: int,
-                      trace_position: int, step_sink=None) -> EpisodeResult:
+                      trace_position: int, step_sink=None, options: dict = None) -> EpisodeResult:
     """Play one full, deterministic episode on `env` (already restricted
     to a single held-out trace) and return its summary. `vecnormalize`
     may be None (no normalization applied - e.g. before Part H's
@@ -195,8 +204,11 @@ def run_eval_episode(env: TileStreamingEnv, model, vecnormalize, seed: int,
 
     `step_sink`, when given, is called as step_sink(step_index, info)
     once per step - used by EvalStepTraceWriter to record the per-step
-    spatial/geometry trace. Default None leaves behavior unchanged."""
-    obs, _info = env.reset(seed=seed)
+    spatial/geometry trace. Default None leaves behavior unchanged.
+
+    `options` is passed to env.reset() - the Lumos5G link's fixed
+    {"window": (run, start)}; None for the rician link."""
+    obs, _info = env.reset(seed=seed, options=options)
     coverages, stalls_sec, powers_mw, n_tiles, psnr_db = [], [], [], [], []
     terminated = truncated = False
     info = {}
@@ -248,7 +260,10 @@ class HeldOutTraceEvalCallback(BaseCallback):
                  best_model_save_path: str = "runs/best", eval_every_n_rollouts: int = 1,
                  feasibility_tol: float = 1e-9, log_dir: str = None,
                  spatial_log_every_n_rollouts: int = 150,
-                 dropped_constraints: frozenset = frozenset(), verbose: int = 0):
+                 dropped_constraints: frozenset = frozenset(), verbose: int = 0,
+                 link: str = "rician", stall_allowance: float = None, lumos_scale: float = 1.0,
+                 lumos_data: dict = None, lumos_eval_windows: int = config.LUMOS5G_EVAL_WINDOWS,
+                 tile_frame: str = "absolute"):
         super().__init__(verbose)
         assert len(eval_trace_indices) == len(eval_seeds), (
             "eval_trace_indices and eval_seeds must be the same length (one seed per held-out trace)"
@@ -278,6 +293,19 @@ class HeldOutTraceEvalCallback(BaseCallback):
         self._episode_writer = None
         self.best_key = (1, float("inf"), float("inf"))
         self.best_checkpoint_step = None
+        self.link = link
+        if link == "lumos5g":
+            assert stall_allowance is not None, "the Lumos5G link judges stall as viewport-only floor + stall_allowance"
+        self.stall_allowance = stall_allowance
+        self.lumos_scale = lumos_scale
+        self.lumos_data = lumos_data
+        self.lumos_eval_windows = lumos_eval_windows
+        self.tile_frame = tile_frame   # must match the training env's (it defines the action and observation)
+        # (env, seed, trace_position, reset options) per eval episode, and
+        # each episode's own stall budget - built in _init_callback.
+        self._episodes = None
+        self._episode_d_bars = None
+        self._stall_floor = None
 
     def _init_callback(self) -> None:
         os.makedirs(self.best_model_save_path, exist_ok=True)
@@ -288,12 +316,55 @@ class HeldOutTraceEvalCallback(BaseCallback):
         # log_counterfactual=True is set HERE and only here: these eval
         # envs run 108 steps per eval, so the extra per-step PSNR call is
         # cheap, while the training envs never pay it.
-        self._eval_envs = [
-            TileStreamingEnv(trace_indices=[idx], log_counterfactual=True)
-            for idx in self.eval_trace_indices
-        ]
+        if self.link == "lumos5g":
+            self._init_lumos_episodes()
+        else:
+            self._eval_envs = [
+                TileStreamingEnv(trace_indices=[idx], log_counterfactual=True, tile_frame=self.tile_frame)
+                for idx in self.eval_trace_indices
+            ]
+            self._episodes = [(env, self.eval_seeds[i], self.eval_trace_indices[i], None)
+                              for i, env in enumerate(self._eval_envs)]
+            self._episode_d_bars = [self.d_bar] * len(self._episodes)
         self._step_trace_writer = EvalStepTraceWriter(self.log_dir)
         self._episode_writer = EvalEpisodeWriter(self.log_dir)
+
+    def _init_lumos_episodes(self) -> None:
+        """Held-out viewers x fixed validation windows; the "seed" column of the
+        eval CSVs is the episode's index into <log_dir>/eval_windows.csv."""
+        data = self.lumos_data if self.lumos_data is not None else lumos5g.load_bundle()
+        envs = {idx: TileStreamingEnv(trace_indices=[idx], log_counterfactual=True, link="lumos5g",
+                                      lumos_split="val", lumos_scale=self.lumos_scale, lumos_data=data,
+                                      tile_frame=self.tile_frame)
+                for idx in self.eval_trace_indices}
+        self._eval_envs = list(envs.values())
+        ep_len = self._eval_envs[0]._ep_len
+        wins = lumos5g.eval_windows(data["runs"], data["splits"]["val"], ep_len, self.lumos_eval_windows)
+        self._episodes = [(envs[idx], i, idx, {"window": w})
+                          for i, (w, idx) in enumerate(product(wins, self.eval_trace_indices))]
+        # viewport-only stall of every eval episode (no extra tiles) - the
+        # unavoidable part, deterministic given the window and viewer
+        no_extra = np.zeros(config.N_TILES, dtype=np.int64)
+        floors = []
+        for env, seed, _idx, opts in self._episodes:
+            env.reset(seed=seed, options=opts)
+            done, info = False, {}
+            while not done:
+                _obs, _r, term, trunc, info = env.step(no_extra)
+                done = term or trunc
+            floors.append(float(info["J_D"]))
+        self._stall_floor = float(np.mean(floors))
+        self._episode_d_bars = [f + self.stall_allowance for f in floors]
+        self.d_bar = self._stall_floor + self.stall_allowance
+        os.makedirs(self.log_dir, exist_ok=True)
+        with open(os.path.join(self.log_dir, "eval_windows.csv"), "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["seed", "trace_position", "run", "start", "viewport_only_J_D", "d_bar"])
+            for (env, seed, idx, opts), fl, db in zip(self._episodes, floors, self._episode_d_bars):
+                w.writerow([seed, idx, opts["window"][0], opts["window"][1], fl, db])
+        if self.verbose >= 1:
+            print(f"Lumos5G eval: {len(self._episodes)} episodes, viewport-only J_D {self._stall_floor:.4f}, "
+                  f"stall allowance {self.stall_allowance} -> eval D_bar {self.d_bar:.4f}")
 
     def _on_step(self) -> bool:
         return True   # all logic runs in _on_rollout_end; abstract method must exist
@@ -316,10 +387,9 @@ class HeldOutTraceEvalCallback(BaseCallback):
             return _sink
 
         results = [
-            run_eval_episode(env, self.model, vecnorm, seed=self.eval_seeds[i],
-                              trace_position=self.eval_trace_indices[i],
-                              step_sink=_make_sink(self.eval_trace_indices[i], self.eval_seeds[i]))
-            for i, env in enumerate(self._eval_envs)
+            run_eval_episode(env, self.model, vecnorm, seed=seed, trace_position=pos,
+                              step_sink=_make_sink(pos, seed), options=opts)
+            for env, seed, pos, opts in self._episodes
         ]
 
         J_Q = float(np.mean([r.J_Q for r in results]))
@@ -333,8 +403,8 @@ class HeldOutTraceEvalCallback(BaseCallback):
         feasible = violation <= self.feasibility_tol
 
         episode_rows = []
-        for r in results:
-            e_viol_D = 0.0 if "D" in self.dropped_constraints else max(0.0, r.J_D - self.d_bar)
+        for r, e_d_bar in zip(results, self._episode_d_bars):
+            e_viol_D = 0.0 if "D" in self.dropped_constraints else max(0.0, r.J_D - e_d_bar)
             e_viol_P = 0.0 if "P" in self.dropped_constraints else max(0.0, r.J_P - self.p_bar)
             e_viol_B = 0.0 if "B" in self.dropped_constraints else max(0.0, r.J_B - self.b_bar)
             e_violation = e_viol_D + e_viol_P + e_viol_B
@@ -355,6 +425,8 @@ class HeldOutTraceEvalCallback(BaseCallback):
             ("mean_psnr_db", float(np.mean([r.mean_psnr_db for r in results]))),
         ]:
             self.logger.record(f"eval/{name}", val)
+        if self._stall_floor is not None:
+            self.logger.record("eval/avoidable_stall", J_D - self._stall_floor)
 
         new_key = _checkpoint_key(feasible, violation, J_Q)
         is_new_best = new_key < self.best_key

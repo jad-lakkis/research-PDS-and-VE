@@ -35,6 +35,11 @@ DATA_DIR = "data"
 HN_MAT_PATH = f"{DATA_DIR}/hn.mat"
 RD_MAT_PATH = f"{DATA_DIR}/rd.mat"
 README_PATH = "other/Readme - Dataset info.txt"   # moved into other/ by the user
+# Lumos5G v1.0 (UMN, IMC'20): commercial mmWave 5G TCP downlink throughput
+# (iPerf, Mbit/s), 1-s samples, 118 runs, Minneapolis "Loop" area. Official
+# release zip (Lumos5G-v1.0.zip, CC BY 4.0 - LICENSE/README kept alongside);
+# SHA-256 0ecebcbb...f013f9a.
+LUMOS5G_CSV_PATH = f"{DATA_DIR}/lumos5g/Lumos5G-v1.0.csv"
 
 # All paths above are relative to the project root - every script in
 # this project (config.py, streaming_rl/*, sanity_check.py, etc.) is
@@ -312,6 +317,28 @@ N_POWER_LEVELS = 5
 # instead of 3 of the 5 levels (75%, 100%, and the coarse jump to 50%)
 # sitting in a region the policy never used at all.
 POWER_LEVEL_MAX_FRACTION = 0.5
+
+# Trace-driven link (Lumos5G) - TileStreamingEnv(link="lumos5g"), off by
+# default (link="rician" is the original synthetic channel, unchanged).
+# The link rate R_t is the MEASURED throughput (streaming_rl/lumos5g.py),
+# not W*log2(1 + P h / (W N0)): power cannot change a measured rate, so it
+# is fixed (the top level, 50 mW - only logged, never affects R_t) and the
+# action is the 64 tile bits alone. R_t is observed before the decision
+# together with the LUMOS5G_N_HISTORY previous samples, all in Mbit/s
+# (Z in Mbit) so the observation stays O(1-1000) before VecNormalize.
+LUMOS5G_N_HISTORY = 5
+LUMOS5G_OBS_SCALE = 1e-6
+FIXED_POWER_WATTS = POWER_LEVEL_MAX_FRACTION * 10 ** ((P_MAX_DBM - 30.0) / 10.0)
+# Unavoidable stall: J_D of "predicted viewport only" (the stall-minimal
+# policy - every extra tile only adds bits) over the exact training
+# distribution (9 training viewers x every start second of every training
+# run, 391,527 episodes; Runner, level 5, raw rates). Stall budget for the
+# Lumos5G runs = this floor + an allowance (--stall-allowance), decided from
+# the baseline replay (VIDEO_SURVEY/lumos5g/budget_compare.csv).
+LUMOS5G_STALL_FLOOR_TRAIN = 1.9433
+# Held-out evaluation: held-out viewers x this many fixed validation-run
+# windows (evenly spaced over the validation runs' 36-s windows).
+LUMOS5G_EVAL_WINDOWS = 12
 
 # PPO's own discount factor. Deliberately NOT reusing
 # DISCOUNT_FACTOR_LAMBDA=0.01 (the paper's CMDP/Bellman lambda, MMSP'25

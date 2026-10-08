@@ -40,7 +40,7 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.utils import explained_variance, obs_as_tensor
 
 import config
-from streaming_rl import pds
+from streaming_rl import pds, tile_frame
 from streaming_rl.pds_buffer import PDSRolloutBuffer
 from streaming_rl.pds_policy import PDSActorCriticPolicy
 
@@ -77,7 +77,11 @@ class PPOWithPDS(PPO):
             "policy= argument like stock PPO's (needed so predict_pds_values() exists)"
         )
         policy_kwargs = dict(kwargs.pop("policy_kwargs", None) or {})
-        policy_kwargs.setdefault("pds_obs_dim", pds.PDS_OBS_DIM)
+        # PDS observation size follows the env's observation (68 for the
+        # rician link, 73 for Lumos5G - see pds.pds_obs_dim). env is None only
+        # inside PPOWithPDS.load(), which restores policy_kwargs from the save.
+        obs_dim = env.observation_space.shape[0] if env is not None else 4
+        policy_kwargs.setdefault("pds_obs_dim", pds.pds_obs_dim(obs_dim))
         policy_kwargs.setdefault("pds_net_arch", pds_net_arch or config.PDS_CRITIC_ARCHITECTURE)
         kwargs["policy_kwargs"] = policy_kwargs
         kwargs["rollout_buffer_class"] = PDSRolloutBuffer
@@ -132,6 +136,15 @@ class PPOWithPDS(PPO):
         self._ve_generator = th.Generator(device=self.device)
         if ve_seed is not None:
             self._ve_generator.manual_seed(ve_seed)
+
+    def _setup_model(self) -> None:
+        super()._setup_model()
+        # PDSRolloutBuffer sizes its PDS-observation array from a class-level
+        # default (68, the rician link); match the policy's actual input size.
+        # Runs on fresh construction and on load() alike.
+        if self.rollout_buffer.pds_obs_dim != self.policy.pds_obs_dim:
+            self.rollout_buffer.pds_obs_dim = self.policy.pds_obs_dim
+            self.rollout_buffer.reset()
 
     def _excluded_save_params(self) -> list:
         # _ve_rd_data caches the ENTIRE rd.mat (all 15 videos' RD tables,
@@ -237,7 +250,7 @@ class PPOWithPDS(PPO):
                 actions = actions.reshape(-1, 1)
 
             # --- Phase A: PDS-specific per-env bookkeeping ---
-            pds_obs = np.zeros((env.num_envs, pds.PDS_OBS_DIM), dtype=np.float32)
+            pds_obs = np.zeros((env.num_envs, self.policy.pds_obs_dim), dtype=np.float32)
             true_next_obs = np.zeros_like(self._last_obs)
             known_rewards = np.zeros(env.num_envs, dtype=np.float32)
             random_rewards = np.zeros(env.num_envs, dtype=np.float32)
@@ -262,7 +275,9 @@ class PPOWithPDS(PPO):
                 else:
                     true_next_obs[idx] = new_obs[idx]
 
-                pds_obs[idx] = pds.build_pds_observation(self._last_obs[idx], true_next_obs[idx], info["tile_mask"])
+                # executed mask in the agent's own coordinates (relative tile frame) or physical
+                pds_obs[idx] = pds.build_pds_observation(self._last_obs[idx], true_next_obs[idx],
+                                                         info.get("tile_mask_rel", info["tile_mask"]))
 
                 r_known, r_random = pds.split_reward(info, mu_d, mu_p, mu_b)
                 known_rewards[idx] = r_known
@@ -305,7 +320,7 @@ class PPOWithPDS(PPO):
         return True
 
     def _sample_distinct_virtual_actions(self, env_idx, mandatory_tile_mask, real_tile_mask_packed,
-                                          n_branches, max_retries=20):
+                                          n_branches, max_retries=20, tile_shift=None):
         """Draw n_branches hypothetical actions from self.policy.action_dist
         (via self._ve_generator - see collect_rollouts for why this can
         safely happen at any point, not just immediately after the real
@@ -333,6 +348,10 @@ class PPOWithPDS(PPO):
         Returns a list of n_branches raw action arrays (still needs
         pds.unpack_action() + mandatory-tile OR-in, same as any other
         raw action - this only decides WHICH actions to keep).
+
+        tile_shift: the real step's relative-tile-frame shift (None = the
+        agent's bits are physical tiles). Duplicates are judged on PHYSICAL
+        masks, like the real executed one.
         """
         accepted_actions = []
         accepted_masks_packed = {real_tile_mask_packed}
@@ -342,6 +361,8 @@ class PPOWithPDS(PPO):
                 sample = _sample_multicategorical(self.policy.action_dist, self._ve_generator)
                 action_np = sample[env_idx].cpu().numpy()
                 agent_mask, _ = pds.unpack_action(action_np)
+                if tile_shift is not None:
+                    agent_mask = tile_frame.rel_to_abs(agent_mask, tile_shift)
                 merged = (agent_mask | mandatory_tile_mask).astype(bool)
                 packed = np.packbits(merged).tobytes()
                 if packed not in accepted_masks_packed:
@@ -381,8 +402,9 @@ class PPOWithPDS(PPO):
         n_branches = self.ve_batch_size
         n_total = n_envs * n_branches
 
-        raw_next_states = np.zeros((n_total, 4), dtype=np.float32)
-        tile_masks = np.zeros((n_total, config.N_TILES), dtype=np.float32)
+        raw_next_states = np.zeros((n_total, self.observation_space.shape[0]), dtype=np.float32)
+        tile_masks = np.zeros((n_total, config.N_TILES), dtype=np.float32)      # physical
+        pds_masks = np.zeros((n_total, config.N_TILES), dtype=np.float32)       # the PDS critic's coordinates
         r_random_batch = np.zeros(n_total, dtype=np.float32)
 
         n_unique_total = 0
@@ -402,12 +424,15 @@ class PPOWithPDS(PPO):
 
             mandatory_mask_bool = info["mandatory_tile_mask"].astype(bool)
             real_mask_packed = np.packbits(info["tile_mask"].astype(bool)).tobytes()
+            tile_shift = info.get("tile_shift")   # relative tile frame: same shift for every branch
             branch_actions = self._sample_distinct_virtual_actions(
-                env_idx, mandatory_mask_bool, real_mask_packed, n_branches,
+                env_idx, mandatory_mask_bool, real_mask_packed, n_branches, tile_shift=tile_shift,
             )
 
             for action_np in branch_actions:
                 agent_tile_mask_b, power_watts_b = pds.unpack_action(action_np)
+                if tile_shift is not None:
+                    agent_tile_mask_b = tile_frame.rel_to_abs(agent_tile_mask_b, tile_shift)
                 phys = pds.compute_virtual_branch_physics(
                     agent_tile_mask_b=agent_tile_mask_b, power_watts_b=power_watts_b,
                     mandatory_tile_mask=info["mandatory_tile_mask"],
@@ -415,12 +440,20 @@ class PPOWithPDS(PPO):
                     gop_index=info["gop_index"], enhanced_level=self._ve_enhanced_level,
                     Z_t=info["Z_t"], h_t=info["h_t"],
                     actual_theta_t=info["actual_theta"], actual_phi_t=info["actual_phi"],
-                    mu_d=mu_d, mu_p=mu_p, mu_b=mu_b,
+                    mu_d=mu_d, mu_p=mu_p, mu_b=mu_b, R_t=info.get("R_t_exogenous"),
                 )
-                raw_next_states[k] = pds.build_raw_next_pds_state(
-                    phys["Z_next_b"], delta_theta_t, delta_phi_t, info["h_next"],
-                )
+                if info.get("next_obs_raw") is not None:
+                    # trace-driven link: next state = real next observation with this branch's buffer
+                    raw_next_states[k] = pds.raw_next_state_from_obs(
+                        info["next_obs_raw"], phys["Z_next_b"], info["z_obs_scale"],
+                    )
+                else:
+                    raw_next_states[k] = pds.build_raw_next_pds_state(
+                        phys["Z_next_b"], delta_theta_t, delta_phi_t, info["h_next"],
+                    )
                 tile_masks[k] = phys["tile_mask_b"].astype(np.float32)
+                pds_masks[k] = (tile_frame.abs_to_rel(phys["tile_mask_b"], tile_shift) if tile_shift is not None
+                                else phys["tile_mask_b"]).astype(np.float32)
                 r_random_batch[k] = phys["r_random_b"]
                 k += 1
 
@@ -440,12 +473,12 @@ class PPOWithPDS(PPO):
         # running training statistics.
         next_states_norm = env.normalize_obs(raw_next_states)
 
-        pds_obs_batch = np.zeros((n_total, pds.PDS_OBS_DIM), dtype=np.float32)
+        pds_obs_batch = np.zeros((n_total, self.policy.pds_obs_dim), dtype=np.float32)
         k = 0
         for env_idx in range(n_envs):
             obs_t = self._last_obs[env_idx]
             for b in range(n_branches):
-                pds_obs_batch[k] = pds.build_pds_observation(obs_t, next_states_norm[k], tile_masks[k])
+                pds_obs_batch[k] = pds.build_pds_observation(obs_t, next_states_norm[k], pds_masks[k])
                 k += 1
 
         # One batched predict_values() call for V_old(omega^{t+1,(b)})

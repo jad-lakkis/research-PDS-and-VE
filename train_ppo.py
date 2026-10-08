@@ -43,7 +43,7 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 import config
-from streaming_rl import data_loader
+from streaming_rl import data_loader, lumos5g
 from streaming_rl.environment import TileStreamingEnv
 from streaming_rl.lagrangian import (
     LagrangianRewardWrapper, dual_ascent_step, mu_init_kwargs, parse_dropped_constraints,
@@ -271,8 +271,53 @@ class TileEnhancementTrackerCallback(BaseCallback):
         self._n_steps_this_rollout = 0
 
 
+def add_link_args(p) -> None:
+    """Link-model flags, shared with train_ppo_pds.py. Default (rician) leaves
+    every existing invocation unchanged."""
+    p.add_argument("--link", type=str, default="rician", choices=["rician", "lumos5g"],
+                   help="rician = synthetic channel + power action (original); lumos5g = measured "
+                        "Lumos5G throughput as R_t, fixed power, tile-only action")
+    p.add_argument("--stall-allowance", type=float, default=None,
+                   help="lumos5g only: stall budget = predicted-viewport-only J_D (unavoidable outage "
+                        "stall) + this; training D_bar = config.LUMOS5G_STALL_FLOOR_TRAIN + this unless "
+                        "--d-bar is given")
+    p.add_argument("--lumos-scale", type=float, default=1.0,
+                   help="lumos5g only: multiplies the measured rates (1.0 = raw)")
+    p.add_argument("--lumos-eval-windows", type=int, default=config.LUMOS5G_EVAL_WINDOWS,
+                   help="lumos5g only: fixed validation windows per held-out viewer in each evaluation")
+    p.add_argument("--tile-frame", type=str, default="absolute", choices=["absolute", "relative"],
+                   help="absolute = action bit i is physical tile i (original); relative = tile bits "
+                        "counted from the predicted viewport's column, with the viewing context "
+                        "(signed head move, predicted elevation/azimuth, video time) in the observation")
+
+
+def link_setup(args, d_bar: float, dropped_constraints: frozenset):
+    """(d_bar, dropped_constraints, env_kwargs, eval_kwargs) for the chosen link
+    and tile frame. lumos5g: power is fixed, so its constraint is dropped; D_bar
+    defaults to the training-run viewport-only stall floor + --stall-allowance."""
+    frame = {} if args.tile_frame == "absolute" else {"tile_frame": args.tile_frame}
+    if args.link == "rician":
+        return d_bar, dropped_constraints, dict(frame), dict(frame)
+    if args.stall_allowance is None:
+        raise ValueError("--link lumos5g needs --stall-allowance (stall budget = viewport-only floor + allowance)")
+    if args.d_bar is None:
+        if args.lumos_scale != 1.0:
+            raise ValueError("config.LUMOS5G_STALL_FLOOR_TRAIN is for raw rates - pass --d-bar with --lumos-scale")
+        d_bar = config.LUMOS5G_STALL_FLOOR_TRAIN + args.stall_allowance
+    if "P" not in dropped_constraints:
+        dropped_constraints = dropped_constraints | {"P"}
+        print("Lumos5G link: power is fixed, dropping the power constraint")
+    data = lumos5g.load_bundle()
+    env_kwargs = dict(link="lumos5g", lumos_split="train", lumos_scale=args.lumos_scale, lumos_data=data, **frame)
+    eval_kwargs = dict(link="lumos5g", stall_allowance=args.stall_allowance, lumos_scale=args.lumos_scale,
+                       lumos_data=data, lumos_eval_windows=args.lumos_eval_windows, **frame)
+    print(f"Lumos5G link: training D_bar={d_bar:.4f} (viewport-only floor {config.LUMOS5G_STALL_FLOOR_TRAIN} "
+          f"+ allowance {args.stall_allowance}), rate scale {args.lumos_scale}")
+    return d_bar, dropped_constraints, env_kwargs, eval_kwargs
+
+
 def build_env(use_lagrangian: bool, trace_indices: list, bundle: dict,
-              dropped_constraints: frozenset = frozenset()):
+              dropped_constraints: frozenset = frozenset(), env_kwargs: dict = None):
     """One (unvectorized) env, Monitor on the outside: Monitor(Lagrangian
     RewardWrapper(TileStreamingEnv(...))) or Monitor(TileStreamingEnv(...))
     for --no-lagrangian. Manual Monitor wrap is required (see module
@@ -283,7 +328,7 @@ def build_env(use_lagrangian: bool, trace_indices: list, bundle: dict,
     pins that constraint's multiplier at 0 from construction - genuine
     removal from the reward, not a loosened budget.
     """
-    env = TileStreamingEnv(trace_indices=trace_indices, bundle=bundle)
+    env = TileStreamingEnv(trace_indices=trace_indices, bundle=bundle, **(env_kwargs or {}))
     if use_lagrangian:
         env = LagrangianRewardWrapper(env, **mu_init_kwargs(dropped_constraints))
     return Monitor(env)
@@ -345,6 +390,7 @@ def parse_args():
     p.add_argument("--drop-constraints", type=str, default="",
                     help="comma-separated subset of D,P,B to remove entirely from the "
                          "reward and feasibility check, e.g. 'P' or 'P,B' (default: none dropped)")
+    add_link_args(p)
     return p.parse_args()
 
 
@@ -364,6 +410,7 @@ def main():
             "(currently unset placeholders) - pick values, pass --d-bar/--p-bar/--b-bar, "
             "or run with --no-lagrangian for the fixed-beta baseline."
         )
+    d_bar, dropped_constraints, env_kwargs, eval_kwargs = link_setup(args, d_bar, dropped_constraints)
 
     # Loaded once, shared between the training env and every held-out
     # eval env - rd_data is read-only after load (measured ~388MB;
@@ -384,7 +431,7 @@ def main():
     # process boundary. Each lambda is independent (no closure/late-binding
     # issue - none of them close over a per-iteration loop variable).
     train_venv = DummyVecEnv([
-        lambda: build_env(use_lagrangian, train_indices, bundle, dropped_constraints)
+        lambda: build_env(use_lagrangian, train_indices, bundle, dropped_constraints, env_kwargs)
         for _ in range(args.n_envs)
     ])
 
@@ -420,6 +467,7 @@ def main():
         log_dir=args.log_dir,
         dropped_constraints=dropped_constraints,
         verbose=1,
+        **eval_kwargs,
     ))
 
     model.learn(total_timesteps=args.total_timesteps, callback=callbacks,

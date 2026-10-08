@@ -36,7 +36,9 @@ from train_ppo import (
     LagrangianMultiplierCallback,
     PhysicalMetricsCallback,
     TileEnhancementTrackerCallback,
+    add_link_args,
     build_env,
+    link_setup,
 )
 
 
@@ -129,6 +131,7 @@ def parse_args():
     p.add_argument("--resume-from", type=str, default=None,
                     help="log-dir of a previous PPO+PDS run to continue from (model+vecnormalize+multipliers)")
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
+    add_link_args(p)
     return p.parse_args()
 
 
@@ -142,6 +145,7 @@ def main():
     p_bar = args.p_bar if args.p_bar is not None else config.P_BAR
     b_bar = args.b_bar if args.b_bar is not None else config.B_BAR
     ent_coef = args.ent_coef if args.ent_coef is not None else config.PDS_ENTROPY_COEF
+    d_bar, dropped_constraints, env_kwargs, eval_kwargs = link_setup(args, d_bar, dropped_constraints)
 
     bundle = data_loader.load_training_video_bundle()
     n_traces = len(bundle["valid_traces"])
@@ -153,7 +157,7 @@ def main():
     train_indices = [i for i in range(n_traces) if i not in eval_indices]
 
     train_venv = DummyVecEnv([
-        lambda: build_env(True, train_indices, bundle, dropped_constraints) for _ in range(args.n_envs)
+        lambda: build_env(True, train_indices, bundle, dropped_constraints, env_kwargs) for _ in range(args.n_envs)
     ])
 
     if args.resume_from is not None:
@@ -193,6 +197,7 @@ def main():
             log_dir=args.log_dir,
             dropped_constraints=dropped_constraints,
             verbose=1,
+            **eval_kwargs,
         ),
     ]
 
