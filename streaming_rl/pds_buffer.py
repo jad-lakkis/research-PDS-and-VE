@@ -144,7 +144,8 @@ class PDSRolloutBuffer(RolloutBuffer):
             "n_branches_total": n,
         }
 
-    def compute_pds_returns_and_advantage(self, policy, last_values: th.Tensor, gae_lambda: float) -> None:
+    def compute_pds_returns_and_advantage(self, policy, last_values: th.Tensor, gae_lambda: float,
+                                          critic_lambda: float = None) -> None:
         """Phase B of the PPO+PDS pseudocode. Must be called once, after the
         rollout is fully collected (self.full is True) and BEFORE any policy
         update this rollout - every target below is computed with the
@@ -155,6 +156,21 @@ class PDSRolloutBuffer(RolloutBuffer):
         gae_lambda has no default - callers must choose explicitly (0 for
         the original one-step PDS advantage, 0.95 to match baseline PPO's
         own GAE horizon).
+
+        critic_lambda: lambda for the ORDINARY critic's target only. None
+        (default) = gae_lambda, the original behaviour: V trains toward
+        A^{gae_lambda} + V_old. Because the PDS residual
+        r_known + Vtilde(omega~) - V does not telescope, a systematic
+        error e in Vtilde enters every term of that trace and shifts V's
+        target by ~e/(1 - gamma*lambda) (~17x at 0.99*0.95); Vtilde's own
+        target then inherits V's error through gamma*V(omega^{t+1}), so
+        the two critics amplify each other. Measured: bounded on the
+        rician channel (Experiment X: V loss ~1e3 for 12k rollouts, mean
+        delta_pds ~ -3 throughout), runaway on Lumos5G (V loss 1e4 by
+        rollout 9, 1e5+ later, no learning). critic_lambda=0 gives V the
+        one-step target r_known + Vtilde(omega~) - the EHS two-critic
+        structure, stable on Lumos5G - while the actor keeps the
+        gae_lambda trace.
 
         V_next^t = 0                              if terminated at t (true episode end - no bootstrap)
                  = V_phi(true_next_obs^t)          if truncated at t (bootstrap from the TRUE cutoff state,
@@ -228,7 +244,17 @@ class PDSRolloutBuffer(RolloutBuffer):
         # as the actor. At gae_lambda=0 this is bit-identical to the old
         # y^t = r_known^t + Vtilde_psi(omega~^t), since advantages+values
         # reduces to delta_pds+values = known_rewards+v_pds exactly.
-        self.ordinary_returns = self.advantages + self.values          # R^t_PDS-GAE
+        if critic_lambda is None or critic_lambda == gae_lambda:
+            self.ordinary_returns = self.advantages + self.values      # R^t_PDS-GAE (original)
+        else:
+            # same backward recursion, the critic's own lambda; at 0 this is
+            # exactly known_rewards + v_pds (delta_pds + values)
+            critic_adv = np.zeros_like(self.values)
+            last_gae_lam = 0
+            for step in reversed(range(self.buffer_size)):
+                last_gae_lam = delta_pds[step] + self.gamma * critic_lambda * next_non_terminal[step] * last_gae_lam
+                critic_adv[step] = last_gae_lam
+            self.ordinary_returns = critic_adv + self.values
 
         self._compute_variance_diagnostics(delta_pds, v_next, next_non_terminal, gae_lambda)
 

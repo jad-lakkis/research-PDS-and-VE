@@ -76,6 +76,16 @@ def parse_args():
     # --clip-range, so pick it from this project's own healthy value/return
     # scale (converged episode reward is O(10) in this project), not
     # copied from clip_range's 0.2.
+    # Ordinary-critic target lambda, separate from the actor's --gae-lambda.
+    # Default (None) = same as --gae-lambda: the original PDS-GAE critic
+    # target, exactly as in every run so far. 0 = V trains on the one-step
+    # target r_known + Vtilde(omega~) while the actor keeps the --gae-lambda
+    # trace - removes the two critics' mutual error amplification (~1/(1 -
+    # gamma*lambda) = ~17x at 0.95) that runs away on Lumos5G (see
+    # streaming_rl/pds_buffer.py compute_pds_returns_and_advantage).
+    p.add_argument("--pds-critic-lambda", type=float, default=None,
+                    help="lambda for the ORDINARY critic's target (default: same as --gae-lambda, the "
+                         "original behaviour); 0 = one-step target r_known + Vtilde, actor keeps --gae-lambda")
     p.add_argument("--clip-range-vf", type=float, default=None,
                     help="value-function clipping (raw units, depends on reward scale - see SB3 docs); "
                          "None (default) = off, matching every run so far")
@@ -145,7 +155,7 @@ def main():
     p_bar = args.p_bar if args.p_bar is not None else config.P_BAR
     b_bar = args.b_bar if args.b_bar is not None else config.B_BAR
     ent_coef = args.ent_coef if args.ent_coef is not None else config.PDS_ENTROPY_COEF
-    d_bar, dropped_constraints, env_kwargs, eval_kwargs = link_setup(args, d_bar, dropped_constraints)
+    d_bar, b_bar, dropped_constraints, env_kwargs, eval_kwargs = link_setup(args, d_bar, b_bar, dropped_constraints)
 
     bundle = data_loader.load_training_video_bundle()
     n_traces = len(bundle["valid_traces"])
@@ -176,10 +186,12 @@ def main():
                             clip_range_vf=args.clip_range_vf, seed=args.seed,
                             ve_enabled=args.ve_enabled, ve_batch_size=args.ve_batch_size,
                             ve_period=args.ve_period, pds_two_pass=args.pds_two_pass,
-                            ve_shared_pass=args.ve_shared_pass,
+                            ve_shared_pass=args.ve_shared_pass, pds_critic_lambda=args.pds_critic_lambda,
                             verbose=1, device=args.device)
         print(f"Fresh start: d_bar={d_bar} p_bar={p_bar} b_bar={b_bar} ent_coef={ent_coef} "
-              f"gae_lambda={args.gae_lambda} clip_range_vf={args.clip_range_vf} "
+              f"gae_lambda={args.gae_lambda} pds_critic_lambda="
+              f"{'same as gae_lambda' if model.pds_critic_lambda is None else model.pds_critic_lambda} "
+              f"clip_range_vf={args.clip_range_vf} "
               f"pds_critic_architecture={config.PDS_CRITIC_ARCHITECTURE} "
               f"ve_enabled={args.ve_enabled} ve_batch_size={args.ve_batch_size} ve_period={args.ve_period} "
               f"pds_two_pass_training={model.pds_two_pass_training} ve_shared_pass={model.ve_shared_pass}")

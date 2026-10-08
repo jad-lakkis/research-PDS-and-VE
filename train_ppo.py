@@ -280,7 +280,7 @@ def add_link_args(p) -> None:
     p.add_argument("--stall-allowance", type=float, default=None,
                    help="lumos5g only: stall budget = predicted-viewport-only J_D (unavoidable outage "
                         "stall) + this; training D_bar = config.LUMOS5G_STALL_FLOOR_TRAIN + this unless "
-                        "--d-bar is given")
+                        "--d-bar is given. Default: config.LUMOS5G_STALL_ALLOWANCE (0.1, the settled value)")
     p.add_argument("--lumos-scale", type=float, default=1.0,
                    help="lumos5g only: multiplies the measured rates (1.0 = raw)")
     p.add_argument("--lumos-eval-windows", type=int, default=config.LUMOS5G_EVAL_WINDOWS,
@@ -291,29 +291,35 @@ def add_link_args(p) -> None:
                         "(signed head move, predicted elevation/azimuth, video time) in the observation")
 
 
-def link_setup(args, d_bar: float, dropped_constraints: frozenset):
-    """(d_bar, dropped_constraints, env_kwargs, eval_kwargs) for the chosen link
-    and tile frame. lumos5g: power is fixed, so its constraint is dropped; D_bar
-    defaults to the training-run viewport-only stall floor + --stall-allowance."""
+def link_setup(args, d_bar: float, b_bar: float, dropped_constraints: frozenset):
+    """(d_bar, b_bar, dropped_constraints, env_kwargs, eval_kwargs) for the chosen
+    link and tile frame. lumos5g: power is fixed, so its constraint is dropped; the
+    budgets default to the settled Lumos5G values (config.LUMOS5G_STALL_ALLOWANCE,
+    config.LUMOS5G_B_BAR) - never to the rician config.D_BAR/B_BAR - and D_bar is
+    the training-run viewport-only stall floor + the stall allowance."""
     frame = {} if args.tile_frame == "absolute" else {"tile_frame": args.tile_frame}
     if args.link == "rician":
-        return d_bar, dropped_constraints, dict(frame), dict(frame)
-    if args.stall_allowance is None:
-        raise ValueError("--link lumos5g needs --stall-allowance (stall budget = viewport-only floor + allowance)")
+        return d_bar, b_bar, dropped_constraints, dict(frame), dict(frame)
+    allowance = args.stall_allowance if args.stall_allowance is not None else config.LUMOS5G_STALL_ALLOWANCE
+    if args.b_bar is None:
+        b_bar = config.LUMOS5G_B_BAR
     if args.d_bar is None:
         if args.lumos_scale != 1.0:
             raise ValueError("config.LUMOS5G_STALL_FLOOR_TRAIN is for raw rates - pass --d-bar with --lumos-scale")
-        d_bar = config.LUMOS5G_STALL_FLOOR_TRAIN + args.stall_allowance
+        d_bar = config.LUMOS5G_STALL_FLOOR_TRAIN + allowance
     if "P" not in dropped_constraints:
         dropped_constraints = dropped_constraints | {"P"}
         print("Lumos5G link: power is fixed, dropping the power constraint")
     data = lumos5g.load_bundle()
     env_kwargs = dict(link="lumos5g", lumos_split="train", lumos_scale=args.lumos_scale, lumos_data=data, **frame)
-    eval_kwargs = dict(link="lumos5g", stall_allowance=args.stall_allowance, lumos_scale=args.lumos_scale,
+    eval_kwargs = dict(link="lumos5g", stall_allowance=allowance, lumos_scale=args.lumos_scale,
                        lumos_data=data, lumos_eval_windows=args.lumos_eval_windows, **frame)
-    print(f"Lumos5G link: training D_bar={d_bar:.4f} (viewport-only floor {config.LUMOS5G_STALL_FLOOR_TRAIN} "
-          f"+ allowance {args.stall_allowance}), rate scale {args.lumos_scale}")
-    return d_bar, dropped_constraints, env_kwargs, eval_kwargs
+    print(f"Lumos5G link: stall allowance {allowance}"
+          f"{'' if args.stall_allowance is not None else ' (config default)'} -> training D_bar={d_bar:.4f} "
+          f"(viewport-only floor {config.LUMOS5G_STALL_FLOOR_TRAIN} + allowance; evaluation: each episode's own "
+          f"floor + allowance); B_bar={b_bar}{'' if args.b_bar is not None else ' (config default)'}; "
+          f"tile frame {args.tile_frame}; rate scale {args.lumos_scale}")
+    return d_bar, b_bar, dropped_constraints, env_kwargs, eval_kwargs
 
 
 def build_env(use_lagrangian: bool, trace_indices: list, bundle: dict,
@@ -410,7 +416,7 @@ def main():
             "(currently unset placeholders) - pick values, pass --d-bar/--p-bar/--b-bar, "
             "or run with --no-lagrangian for the fixed-beta baseline."
         )
-    d_bar, dropped_constraints, env_kwargs, eval_kwargs = link_setup(args, d_bar, dropped_constraints)
+    d_bar, b_bar, dropped_constraints, env_kwargs, eval_kwargs = link_setup(args, d_bar, b_bar, dropped_constraints)
 
     # Loaded once, shared between the training env and every held-out
     # eval env - rd_data is read-only after load (measured ~388MB;

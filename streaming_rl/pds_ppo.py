@@ -71,7 +71,8 @@ def _sample_multicategorical(distribution, generator: th.Generator) -> th.Tensor
 class PPOWithPDS(PPO):
     def __init__(self, policy=PDSActorCriticPolicy, env=None, pds_net_arch: list = None,
                  ve_enabled: bool = False, ve_batch_size: int = 0, ve_period: int = 10,
-                 pds_two_pass: bool = False, ve_shared_pass: bool = False, **kwargs):
+                 pds_two_pass: bool = False, ve_shared_pass: bool = False,
+                 pds_critic_lambda: float = None, **kwargs):
         assert policy is PDSActorCriticPolicy, (
             "PPOWithPDS always uses PDSActorCriticPolicy - it's not a swappable "
             "policy= argument like stock PPO's (needed so predict_pds_values() exists)"
@@ -117,6 +118,15 @@ class PPOWithPDS(PPO):
         # affect results? All three structures apply the same vf_coef
         # weighting to the PDS-critic loss (see _train_pds_critic/
         # _train_policy_and_value) - never a deliberate difference.
+        # Lambda for the ORDINARY critic's target (see
+        # PDSRolloutBuffer.compute_pds_returns_and_advantage). None = same as
+        # gae_lambda (original behaviour, Experiment X); 0 = one-step target
+        # r_known + Vtilde(omega~), removing the two critics' mutual error
+        # amplification while the actor keeps the gae_lambda trace. Restored
+        # by load() like the other attributes; checkpoints saved before this
+        # existed keep the None set here.
+        self.pds_critic_lambda = None if pds_critic_lambda is None else float(pds_critic_lambda)
+
         self.ve_shared_pass = self.ve_enabled and bool(ve_shared_pass)
         if self.ve_shared_pass:
             self.pds_two_pass_training = False
@@ -313,6 +323,7 @@ class PPOWithPDS(PPO):
 
         rollout_buffer.compute_pds_returns_and_advantage(
             self.policy, last_values=last_values, gae_lambda=self.gae_lambda,
+            critic_lambda=getattr(self, "pds_critic_lambda", None),
         )
 
         callback.update_locals(locals())

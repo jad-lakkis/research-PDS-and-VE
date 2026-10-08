@@ -336,6 +336,15 @@ FIXED_POWER_WATTS = POWER_LEVEL_MAX_FRACTION * 10 ** ((P_MAX_DBM - 30.0) / 10.0)
 # Lumos5G runs = this floor + an allowance (--stall-allowance), decided from
 # the baseline replay (VIDEO_SURVEY/lumos5g/budget_compare.csv).
 LUMOS5G_STALL_FLOOR_TRAIN = 1.9433
+# Settled budgets for the Lumos5G runs (user decision 2026-10-08, from the
+# baseline replay at budgets 10/11/12 - other/decision_log.md "Lumos5G" rows):
+# stall allowance 0.1 -> training D_bar = 1.9433 + 0.1 = 2.0433, evaluation
+# judges each episode against its own viewport-only stall + 0.1; tile budget
+# B_bar = 11 (~23 tiles per segment). Used by train_ppo*.py --link lumos5g
+# when --stall-allowance / --b-bar are not given. config.D_BAR/B_BAR below
+# are the rician (synthetic-channel) budgets and do NOT apply here.
+LUMOS5G_STALL_ALLOWANCE = 0.1
+LUMOS5G_B_BAR = 11.0
 # Held-out evaluation: held-out viewers x this many fixed validation-run
 # windows (evenly spaced over the validation runs' 36-s windows).
 LUMOS5G_EVAL_WINDOWS = 12
