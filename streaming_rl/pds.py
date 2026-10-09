@@ -13,7 +13,7 @@ the env's own info dict, so they're testable in isolation.
 import numpy as np
 
 import config
-from streaming_rl import channel_model, layer_model, viewport
+from streaming_rl import channel_model, layer_model, lumos5g, viewport
 
 def pds_obs_dim(obs_dim: int) -> int:
     """Z-tilde (1) + every other component of omega^t, reused as-is
@@ -98,18 +98,23 @@ def build_raw_next_pds_state(Z_next_b: float, delta_theta_t: float, delta_phi_t:
 
 
 def raw_next_state_from_obs(next_obs_raw: np.ndarray, Z_next_b: float, z_obs_scale: float,
-                            ratio_index: int = None, next_R: float = None, next_A_forced: float = None) -> np.ndarray:
+                            ratio_index: int = None, next_R: float = None, next_A_forced: float = None,
+                            obs_buffer: str = "linear") -> np.ndarray:
     """Raw omega^{t+1,(b)} for a trace-driven link (Lumos5G): the real raw
     next observation with only its buffer replaced by the branch's own
     Z_next_b - every other component (Delta^t, R^{t+1} and its history) is
     the same for every hypothetical action. Same scaling as
     environment.py::_lumos_observation(). With the forced-bits observation
     (ratio_index given) the buffer also enters the ratio
-    (Z^{t+1} + T0 R^{t+1}) / A_forced^{t+1}, recomputed for the branch."""
+    (Z^{t+1} + T0 R^{t+1}) / A_forced^{t+1}, recomputed for the branch.
+    obs_buffer: the env's encoding of both (info["obs_buffer"]; lumos5g.buffer_obs / ratio_obs)."""
     out = np.array(next_obs_raw, dtype=np.float32, copy=True)
-    out[0] = np.float32(Z_next_b * z_obs_scale)
+    if obs_buffer == "linear":
+        out[0] = np.float32(Z_next_b * z_obs_scale)
+    else:
+        out[0] = np.float32(lumos5g.buffer_obs(Z_next_b, obs_buffer))
     if ratio_index is not None:
-        out[ratio_index] = np.float32((Z_next_b + config.T0_SEC * next_R) / next_A_forced)
+        out[ratio_index] = np.float32(lumos5g.ratio_obs((Z_next_b + config.T0_SEC * next_R) / next_A_forced, obs_buffer))
     return out
 
 

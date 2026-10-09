@@ -458,6 +458,7 @@ class PPOWithPDS(PPO):
                     raw_next_states[k] = pds.raw_next_state_from_obs(
                         info["next_obs_raw"], phys["Z_next_b"], info["z_obs_scale"],
                         info.get("obs_ratio_index"), info.get("next_R"), info.get("next_A_forced"),
+                        info.get("obs_buffer", "linear"),
                     )
                 else:
                     raw_next_states[k] = pds.build_raw_next_pds_state(

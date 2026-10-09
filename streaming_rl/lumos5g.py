@@ -17,6 +17,20 @@ import config
 
 SPLIT_SEED = 0
 SPLIT_FRACTIONS = (0.70, 0.15, 0.15)   # train, validation, test (fraction of runs)
+OBS_BUFFER_MODES = ("linear", "log")
+
+
+def buffer_obs(Z_bits, mode="linear"):
+    """The buffer as the observation carries it: Mbit ("linear", the original)
+    or log(1 + Z / config.LUMOS5G_OBS_BUFFER_REF_BITS) ("log", --obs-buffer log)."""
+    if mode == "linear":
+        return Z_bits * config.LUMOS5G_OBS_SCALE
+    return np.log1p(Z_bits / config.LUMOS5G_OBS_BUFFER_REF_BITS)
+
+
+def ratio_obs(ratio, mode="linear"):
+    """(Z + T0 R) / forced bits as the observation carries it: as is, or log(1 + ratio)."""
+    return ratio if mode == "linear" else np.log1p(ratio)
 
 
 def load(path=None):

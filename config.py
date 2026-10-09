@@ -328,6 +328,14 @@ POWER_LEVEL_MAX_FRACTION = 0.5
 # (Z in Mbit) so the observation stays O(1-1000) before VecNormalize.
 LUMOS5G_N_HISTORY = 5
 LUMOS5G_OBS_SCALE = 1e-6
+# --obs-buffer log (Lumos5G only, default off): the buffer enters the
+# observation as log(1 + Z / this) and the forced-bits ratio as
+# log(1 + ratio). The buffer has no cap, so in 5G stretches it reaches tens
+# of Gbit; on the linear Mbit scale VecNormalize then squashes the
+# near-empty region the stall decision depends on (empty vs one forced
+# second = 0.017 std on Lumos5G, 1.3 std on the old channel) - decision_log L9.
+# 100 Mbit ~ one second of the forced stream (129 Mbit for Runner).
+LUMOS5G_OBS_BUFFER_REF_BITS = 1e8
 FIXED_POWER_WATTS = POWER_LEVEL_MAX_FRACTION * 10 ** ((P_MAX_DBM - 30.0) / 10.0)
 # Unavoidable stall: J_D of "predicted viewport only" (the stall-minimal
 # policy - every extra tile only adds bits) over the exact training

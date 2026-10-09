@@ -86,6 +86,11 @@ Lumos5G-only options (both off by default):
     predicted-viewport-only J_D (info["J_D_floor"]): the stall no tile
     choice could avoid in this (viewer, window), used by the training
     multiplier to compare only the avoidable part with the allowance.
+  obs_buffer - "linear" (default): buffer in Mbit, forced-bits ratio as is;
+    "log": log(1 + Z / config.LUMOS5G_OBS_BUFFER_REF_BITS) and log(1 + ratio).
+    The buffer has no cap, so 5G stretches fill it to tens of Gbit and, on
+    the linear scale, VecNormalize squashes the near-empty region where the
+    stall decision is made. Only the observation changes.
 """
 
 import numpy as np
@@ -103,7 +108,8 @@ class TileStreamingEnv(gym.Env):
     def __init__(self, enhanced_level: int = None, trace_indices: list = None, bundle: dict = None,
                  log_counterfactual: bool = False, link: str = "rician", lumos_split: str = "train",
                  lumos_scale: float = 1.0, lumos_data: dict = None, tile_frame: str = "absolute",
-                 obs_forced_bits: bool = False, episode_stall_floor: bool = False):
+                 obs_forced_bits: bool = False, episode_stall_floor: bool = False,
+                 obs_buffer: str = "linear"):
         super().__init__()
 
         # Eval-only diagnostic: when True, step() additionally reports what
@@ -216,6 +222,9 @@ class TileStreamingEnv(gym.Env):
             "obs_forced_bits / episode_stall_floor need the Lumos5G link (R^t known before the decision)")
         self._obs_forced_bits = bool(obs_forced_bits)
         self._episode_stall_floor = bool(episode_stall_floor)
+        assert obs_buffer in lumos5g.OBS_BUFFER_MODES, f"unknown obs_buffer {obs_buffer!r}"
+        assert link == "lumos5g" or obs_buffer == "linear", "obs_buffer='log' needs the Lumos5G link"
+        self._obs_buffer = obs_buffer
         self._A_forced = None
         self._J_D_floor = None
         if self._obs_forced_bits:
@@ -276,7 +285,7 @@ class TileStreamingEnv(gym.Env):
         # physics quantity (info, buffer, stall) stays in bits.
         s = config.LUMOS5G_OBS_SCALE
         link = self._R[t:t + self._n_hist + 1][::-1] * s
-        return np.concatenate([[Z * s, delta_theta, delta_phi], link]).astype(np.float32)
+        return np.concatenate([[lumos5g.buffer_obs(Z, self._obs_buffer), delta_theta, delta_phi], link]).astype(np.float32)
 
     def _relative_observation(self, Z, dtheta, dphi, pred_theta, pred_phi, t, h) -> np.ndarray:
         # Viewing context for viewport-relative tile bits (see module docstring).
@@ -285,11 +294,13 @@ class TileStreamingEnv(gym.Env):
         if self._link == "lumos5g":
             zs = config.LUMOS5G_OBS_SCALE
             link = self._R[t:t + self._n_hist + 1][::-1] * zs
+            z_obs = lumos5g.buffer_obs(Z, self._obs_buffer)
         else:
             zs = 1.0
             link = [h * config.H_OBSERVATION_PRESCALE]
+            z_obs = Z * zs
         th = np.deg2rad(pred_theta)
-        view = [Z * zs, dtheta, dphi, pred_phi, tile_frame.column_offset_deg(pred_theta),
+        view = [z_obs, dtheta, dphi, pred_phi, tile_frame.column_offset_deg(pred_theta),
                 np.sin(th), np.cos(th), t / self._ep_len]
         return np.concatenate([view, link]).astype(np.float32)
 
@@ -321,7 +332,8 @@ class TileStreamingEnv(gym.Env):
     def _forced_part(self, Z, t):
         k = min(t, self._ep_len - 1)
         A = self._A_forced[k]
-        return np.array([A * config.LUMOS5G_OBS_SCALE, (Z + config.T0_SEC * self._R[self._n_hist + t]) / A],
+        return np.array([A * config.LUMOS5G_OBS_SCALE,
+                         lumos5g.ratio_obs((Z + config.T0_SEC * self._R[self._n_hist + t]) / A, self._obs_buffer)],
                         dtype=np.float32)
 
     # -- gymnasium API ------------------------------------------------------
@@ -550,6 +562,7 @@ class TileStreamingEnv(gym.Env):
             # measured rate: the same for every hypothetical action
             info["R_t_exogenous"] = R_t
             info["lumos_window"] = self._window
+            info["obs_buffer"] = self._obs_buffer   # how a virtual next state must encode its buffer/ratio
         if self._obs_forced_bits:
             # the next observation's ratio depends on the buffer, so a virtual
             # branch must recompute it (pds.raw_next_state_from_obs)

@@ -305,6 +305,9 @@ def add_link_args(p) -> None:
     p.add_argument("--obs-forced-bits", action="store_true",
                    help="lumos5g only: add this second's forced-stream bits (base layer + predicted-viewport "
                         "tiles, Mbit) and (buffer + rate) / forced bits to the observation")
+    p.add_argument("--obs-buffer", type=str, default="linear", choices=["linear", "log"],
+                   help="lumos5g only: linear = buffer in Mbit (original); log = log(1 + buffer / 100 Mbit) and "
+                        "log(1 + forced-bits ratio), so the near-empty buffer stays visible after VecNormalize")
     p.add_argument("--stall-floor-paired", action="store_true",
                    help="lumos5g only: the stall multiplier compares each training episode's stall minus its "
                         "own predicted-viewport-only stall with the allowance (same constraint, less noise)")
@@ -322,11 +325,13 @@ def link_setup(args, d_bar: float, b_bar: float, dropped_constraints: frozenset)
     the training-run viewport-only stall floor + the stall allowance."""
     frame = {} if args.tile_frame == "absolute" else {"tile_frame": args.tile_frame}
     if args.link == "rician":
-        if args.obs_forced_bits or args.stall_floor_paired:
-            raise ValueError("--obs-forced-bits / --stall-floor-paired need --link lumos5g")
+        if args.obs_forced_bits or args.stall_floor_paired or args.obs_buffer != "linear":
+            raise ValueError("--obs-forced-bits / --stall-floor-paired / --obs-buffer need --link lumos5g")
         return d_bar, b_bar, dropped_constraints, dict(frame), dict(frame)
     if args.obs_forced_bits:
         frame["obs_forced_bits"] = True
+    if args.obs_buffer != "linear":
+        frame["obs_buffer"] = args.obs_buffer
     allowance = args.stall_allowance if args.stall_allowance is not None else config.LUMOS5G_STALL_ALLOWANCE
     if args.b_bar is None:
         b_bar = config.LUMOS5G_B_BAR
@@ -346,7 +351,7 @@ def link_setup(args, d_bar: float, b_bar: float, dropped_constraints: frozenset)
           f"{'' if args.stall_allowance is not None else ' (config default)'} -> training D_bar={d_bar:.4f} "
           f"(viewport-only floor {config.LUMOS5G_STALL_FLOOR_TRAIN} + allowance; evaluation: each episode's own "
           f"floor + allowance); B_bar={b_bar}{'' if args.b_bar is not None else ' (config default)'}; "
-          f"tile frame {args.tile_frame}; rate scale {args.lumos_scale}; obs_forced_bits={args.obs_forced_bits}; "
+          f"tile frame {args.tile_frame}; rate scale {args.lumos_scale}; obs_forced_bits={args.obs_forced_bits}; obs_buffer={args.obs_buffer}; "
           f"stall_floor_paired={args.stall_floor_paired}")
     return d_bar, b_bar, dropped_constraints, env_kwargs, eval_kwargs
 
