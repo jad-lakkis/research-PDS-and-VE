@@ -201,7 +201,8 @@ def main():
         PhysicalMetricsCallback(),
         TileEnhancementTrackerCallback(log_dir=args.log_dir),
         LagrangianMultiplierCallback(d_bar=d_bar, p_bar=p_bar, b_bar=b_bar, eta=config.MU_LEARNING_RATE,
-                                      dropped_constraints=dropped_constraints, log_dir=args.log_dir),
+                                      dropped_constraints=dropped_constraints, log_dir=args.log_dir,
+                                      paired_floor=args.stall_floor_paired),
         HeldOutTraceEvalCallback(
             d_bar=d_bar, p_bar=p_bar, b_bar=b_bar,
             best_model_save_path=os.path.join(args.log_dir, "best"),

@@ -75,6 +75,17 @@ Tile frame (constructor argument "tile_frame"):
      predicted azimuth theta_hat, video time t/T, link part)
     with link part = R^t, ..., R^{t-5} (Lumos5G, 14 numbers in total) or
     h^t (rician, 9 in total).
+
+Lumos5G-only options (both off by default):
+  obs_forced_bits - append the bits of this second's forced stream
+    A_forced^t = A_base^t + sum of the predicted-viewport tiles' enhancement
+    (Mbit) and the ratio (Z^t + T0 R^t) / A_forced^t: whether the link and
+    buffer can carry the forced tiles right now, the quantity a
+    link-adaptive rule decides on.
+  episode_stall_floor - report, on the terminal step, the episode's own
+    predicted-viewport-only J_D (info["J_D_floor"]): the stall no tile
+    choice could avoid in this (viewer, window), used by the training
+    multiplier to compare only the avoidable part with the allowance.
 """
 
 import numpy as np
@@ -91,7 +102,8 @@ class TileStreamingEnv(gym.Env):
 
     def __init__(self, enhanced_level: int = None, trace_indices: list = None, bundle: dict = None,
                  log_counterfactual: bool = False, link: str = "rician", lumos_split: str = "train",
-                 lumos_scale: float = 1.0, lumos_data: dict = None, tile_frame: str = "absolute"):
+                 lumos_scale: float = 1.0, lumos_data: dict = None, tile_frame: str = "absolute",
+                 obs_forced_bits: bool = False, episode_stall_floor: bool = False):
         super().__init__()
 
         # Eval-only diagnostic: when True, step() additionally reports what
@@ -200,6 +212,21 @@ class TileStreamingEnv(gym.Env):
                 dtype=np.float32,
             )
 
+        assert link == "lumos5g" or not (obs_forced_bits or episode_stall_floor), (
+            "obs_forced_bits / episode_stall_floor need the Lumos5G link (R^t known before the decision)")
+        self._obs_forced_bits = bool(obs_forced_bits)
+        self._episode_stall_floor = bool(episode_stall_floor)
+        self._A_forced = None
+        self._J_D_floor = None
+        if self._obs_forced_bits:
+            n = self.observation_space.shape[0]
+            self.observation_space = spaces.Box(
+                low=np.concatenate([self.observation_space.low, [0.0, 0.0]]).astype(np.float32),
+                high=np.concatenate([self.observation_space.high, [np.inf, np.inf]]).astype(np.float32),
+                dtype=np.float32,
+            )
+            self._ratio_index = n + 1
+
         self._P_max_watts = channel_model.dbm_to_watts(config.P_MAX_DBM)
 
         # Per-episode state, set in reset()
@@ -266,6 +293,37 @@ class TileStreamingEnv(gym.Env):
                 np.sin(th), np.cos(th), t / self._ep_len]
         return np.concatenate([view, link]).astype(np.float32)
 
+    def _forced_stream(self):
+        """A_forced^t for every t of the episode: base layer + predicted-viewport
+        tiles (prediction = last actual viewport, as in step()) - fixed by the
+        viewer trace, independent of the agent."""
+        A = np.zeros(self._ep_len)
+        for t in range(self._ep_len):
+            th, ph = self._actual_theta_phi(max(t - 1, 0))
+            mask = viewport.mandatory_tile_mask(th, ph)
+            A[t] = layer_model.compute_A_t(self._rd_data, config.TRAINING_VIDEO_ARRAY_INDEX, t, mask,
+                                           enhanced_level=self._enhanced_level)["A_t"]
+        return A
+
+    def _viewport_only_stall(self):
+        """J_D of sending only the forced stream over this episode's window."""
+        Z, J = 0.0, 0.0
+        T0 = config.T0_SEC
+        for t in range(self._ep_len):
+            R, A = self._R[self._n_hist + t], self._A_forced[t]
+            if Z + T0 * R < A:
+                J += config.DISCOUNT_FACTOR_LAMBDA ** t * (1.0 - (Z + T0 * R) / A)
+                Z = 0.0
+            else:
+                Z = Z + T0 * R - A
+        return J
+
+    def _forced_part(self, Z, t):
+        k = min(t, self._ep_len - 1)
+        A = self._A_forced[k]
+        return np.array([A * config.LUMOS5G_OBS_SCALE, (Z + config.T0_SEC * self._R[self._n_hist + t]) / A],
+                        dtype=np.float32)
+
     # -- gymnasium API ------------------------------------------------------
 
     def reset(self, *, seed=None, options=None):
@@ -304,6 +362,11 @@ class TileStreamingEnv(gym.Env):
             obs = self._observation(self._Z, delta_theta_prev, delta_phi_prev, self._h)
         if self._tile_frame == "relative":
             obs = self._relative_observation(self._Z, 0.0, 0.0, actual_theta_0, actual_phi_0, 0, self._h)
+        if self._obs_forced_bits or self._episode_stall_floor:
+            self._A_forced = self._forced_stream()
+            self._J_D_floor = self._viewport_only_stall() if self._episode_stall_floor else None
+        if self._obs_forced_bits:
+            obs = np.concatenate([obs, self._forced_part(self._Z, 0)]).astype(np.float32)
         info = {}
         return obs, info
 
@@ -420,6 +483,8 @@ class TileStreamingEnv(gym.Env):
             obs = self._lumos_observation(Z_next, delta_theta_t, delta_phi_t, next_t)
         else:
             obs = self._observation(Z_next, delta_theta_t, delta_phi_t, h_next)
+        if self._obs_forced_bits:
+            obs = np.concatenate([obs, self._forced_part(Z_next, next_t)]).astype(np.float32)
         info = {
             "A_t": A_t,
             "A_base": a_result["A_base"],
@@ -485,6 +550,12 @@ class TileStreamingEnv(gym.Env):
             # measured rate: the same for every hypothetical action
             info["R_t_exogenous"] = R_t
             info["lumos_window"] = self._window
+        if self._obs_forced_bits:
+            # the next observation's ratio depends on the buffer, so a virtual
+            # branch must recompute it (pds.raw_next_state_from_obs)
+            info["obs_ratio_index"] = self._ratio_index
+            info["next_R"] = float(self._R[self._n_hist + next_t])
+            info["next_A_forced"] = float(self._A_forced[min(next_t, self._ep_len - 1)])
         if self._tile_frame == "relative":
             # agent_tile_mask/tile_mask above are PHYSICAL; the PDS critic and
             # virtual experience also need the shift and the executed mask in
@@ -517,6 +588,8 @@ class TileStreamingEnv(gym.Env):
             info["J_D"] = self._J_D
             info["J_P"] = self._J_P
             info["J_B"] = self._J_B
+            if self._episode_stall_floor:
+                info["J_D_floor"] = self._J_D_floor
         return obs, r_t, terminated, False, info
 
     def np_random_as_generator(self) -> np.random.Generator:

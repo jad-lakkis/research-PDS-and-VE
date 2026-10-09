@@ -97,14 +97,19 @@ def build_raw_next_pds_state(Z_next_b: float, delta_theta_t: float, delta_phi_t:
     )
 
 
-def raw_next_state_from_obs(next_obs_raw: np.ndarray, Z_next_b: float, z_obs_scale: float) -> np.ndarray:
+def raw_next_state_from_obs(next_obs_raw: np.ndarray, Z_next_b: float, z_obs_scale: float,
+                            ratio_index: int = None, next_R: float = None, next_A_forced: float = None) -> np.ndarray:
     """Raw omega^{t+1,(b)} for a trace-driven link (Lumos5G): the real raw
     next observation with only its buffer replaced by the branch's own
     Z_next_b - every other component (Delta^t, R^{t+1} and its history) is
     the same for every hypothetical action. Same scaling as
-    environment.py::_lumos_observation()."""
+    environment.py::_lumos_observation(). With the forced-bits observation
+    (ratio_index given) the buffer also enters the ratio
+    (Z^{t+1} + T0 R^{t+1}) / A_forced^{t+1}, recomputed for the branch."""
     out = np.array(next_obs_raw, dtype=np.float32, copy=True)
     out[0] = np.float32(Z_next_b * z_obs_scale)
+    if ratio_index is not None:
+        out[ratio_index] = np.float32((Z_next_b + config.T0_SEC * next_R) / next_A_forced)
     return out
 
 

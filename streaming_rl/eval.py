@@ -263,7 +263,7 @@ class HeldOutTraceEvalCallback(BaseCallback):
                  dropped_constraints: frozenset = frozenset(), verbose: int = 0,
                  link: str = "rician", stall_allowance: float = None, lumos_scale: float = 1.0,
                  lumos_data: dict = None, lumos_eval_windows: int = config.LUMOS5G_EVAL_WINDOWS,
-                 tile_frame: str = "absolute"):
+                 tile_frame: str = "absolute", obs_forced_bits: bool = False):
         super().__init__(verbose)
         assert len(eval_trace_indices) == len(eval_seeds), (
             "eval_trace_indices and eval_seeds must be the same length (one seed per held-out trace)"
@@ -301,6 +301,7 @@ class HeldOutTraceEvalCallback(BaseCallback):
         self.lumos_data = lumos_data
         self.lumos_eval_windows = lumos_eval_windows
         self.tile_frame = tile_frame   # must match the training env's (it defines the action and observation)
+        self.obs_forced_bits = obs_forced_bits   # same: changes the observation
         # (env, seed, trace_position, reset options) per eval episode, and
         # each episode's own stall budget - built in _init_callback.
         self._episodes = None
@@ -335,7 +336,7 @@ class HeldOutTraceEvalCallback(BaseCallback):
         data = self.lumos_data if self.lumos_data is not None else lumos5g.load_bundle()
         envs = {idx: TileStreamingEnv(trace_indices=[idx], log_counterfactual=True, link="lumos5g",
                                       lumos_split="val", lumos_scale=self.lumos_scale, lumos_data=data,
-                                      tile_frame=self.tile_frame)
+                                      tile_frame=self.tile_frame, obs_forced_bits=self.obs_forced_bits)
                 for idx in self.eval_trace_indices}
         self._eval_envs = list(envs.values())
         ep_len = self._eval_envs[0]._ep_len

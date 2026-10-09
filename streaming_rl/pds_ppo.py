@@ -457,6 +457,7 @@ class PPOWithPDS(PPO):
                     # trace-driven link: next state = real next observation with this branch's buffer
                     raw_next_states[k] = pds.raw_next_state_from_obs(
                         info["next_obs_raw"], phys["Z_next_b"], info["z_obs_scale"],
+                        info.get("obs_ratio_index"), info.get("next_R"), info.get("next_A_forced"),
                     )
                 else:
                     raw_next_states[k] = pds.build_raw_next_pds_state(

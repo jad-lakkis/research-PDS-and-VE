@@ -85,9 +85,17 @@ class LagrangianMultiplierCallback(BaseCallback):
 
     def __init__(self, d_bar: float, p_bar: float, b_bar: float, eta: float,
                  dropped_constraints: frozenset = frozenset(), log_dir: str = None,
-                 feasibility_tol: float = 1e-9, verbose: int = 0):
+                 feasibility_tol: float = 1e-9, paired_floor: bool = False, verbose: int = 0):
         super().__init__(verbose)
         self.d_bar, self.p_bar, self.b_bar, self.eta = d_bar, p_bar, b_bar, eta
+        # Lumos5G --stall-floor-paired: the stall multiplier compares each
+        # episode's J_D minus its OWN predicted-viewport-only J_D
+        # (info["J_D_floor"], the outage stall no tile choice can avoid),
+        # shifted by the training-average floor so d_bar keeps its meaning.
+        # Same constraint in expectation; removes the window-to-window outage
+        # noise (~9x smaller rollout-to-rollout swing).
+        self.paired_floor = bool(paired_floor)
+        self._J_D_floor_buffer: list = []
         # Dropped constraints' multipliers stay pinned at their 0.0 init
         # (set via mu_init_kwargs when the env was built) - dual ascent
         # never touches them, so they never drift off 0 regardless of
@@ -116,6 +124,8 @@ class LagrangianMultiplierCallback(BaseCallback):
         for env_index, info in enumerate(self.locals["infos"]):
             if "J_D" in info:   # terminal step only
                 self._J_D_buffer.append(info["J_D"])
+                if self.paired_floor:
+                    self._J_D_floor_buffer.append(info["J_D_floor"])
                 self._J_P_buffer.append(info["J_P"])
                 self._J_B_buffer.append(info["J_B"])
                 self._env_index_buffer.append(env_index)
@@ -134,10 +144,17 @@ class LagrangianMultiplierCallback(BaseCallback):
         avg_J_D = sum(self._J_D_buffer) / n
         avg_J_P = sum(self._J_P_buffer) / n
         avg_J_B = sum(self._J_B_buffer) / n
+        J_D_for_update = avg_J_D
+        if self.paired_floor:
+            avg_floor = sum(self._J_D_floor_buffer) / n
+            J_D_for_update = avg_J_D - avg_floor + config.LUMOS5G_STALL_FLOOR_TRAIN
+            self.logger.record("lagrangian/avg_J_D_floor", avg_floor)
+            self.logger.record("lagrangian/avg_avoidable_stall", avg_J_D - avg_floor)
+            self._J_D_floor_buffer.clear()
 
         current = self.training_env.env_method("get_multipliers")[0]
         new_mu_D = (0.0 if "D" in self.dropped_constraints
-                    else dual_ascent_step(current["mu_D"], avg_J_D, self.d_bar, self.eta))
+                    else dual_ascent_step(current["mu_D"], J_D_for_update, self.d_bar, self.eta))
         new_mu_P = (0.0 if "P" in self.dropped_constraints
                     else dual_ascent_step(current["mu_P"], avg_J_P, self.p_bar, self.eta))
         new_mu_B = (0.0 if "B" in self.dropped_constraints
@@ -285,6 +302,12 @@ def add_link_args(p) -> None:
                    help="lumos5g only: multiplies the measured rates (1.0 = raw)")
     p.add_argument("--lumos-eval-windows", type=int, default=config.LUMOS5G_EVAL_WINDOWS,
                    help="lumos5g only: fixed validation windows per held-out viewer in each evaluation")
+    p.add_argument("--obs-forced-bits", action="store_true",
+                   help="lumos5g only: add this second's forced-stream bits (base layer + predicted-viewport "
+                        "tiles, Mbit) and (buffer + rate) / forced bits to the observation")
+    p.add_argument("--stall-floor-paired", action="store_true",
+                   help="lumos5g only: the stall multiplier compares each training episode's stall minus its "
+                        "own predicted-viewport-only stall with the allowance (same constraint, less noise)")
     p.add_argument("--tile-frame", type=str, default="absolute", choices=["absolute", "relative"],
                    help="absolute = action bit i is physical tile i (original); relative = tile bits "
                         "counted from the predicted viewport's column, with the viewing context "
@@ -299,7 +322,11 @@ def link_setup(args, d_bar: float, b_bar: float, dropped_constraints: frozenset)
     the training-run viewport-only stall floor + the stall allowance."""
     frame = {} if args.tile_frame == "absolute" else {"tile_frame": args.tile_frame}
     if args.link == "rician":
+        if args.obs_forced_bits or args.stall_floor_paired:
+            raise ValueError("--obs-forced-bits / --stall-floor-paired need --link lumos5g")
         return d_bar, b_bar, dropped_constraints, dict(frame), dict(frame)
+    if args.obs_forced_bits:
+        frame["obs_forced_bits"] = True
     allowance = args.stall_allowance if args.stall_allowance is not None else config.LUMOS5G_STALL_ALLOWANCE
     if args.b_bar is None:
         b_bar = config.LUMOS5G_B_BAR
@@ -311,14 +338,16 @@ def link_setup(args, d_bar: float, b_bar: float, dropped_constraints: frozenset)
         dropped_constraints = dropped_constraints | {"P"}
         print("Lumos5G link: power is fixed, dropping the power constraint")
     data = lumos5g.load_bundle()
-    env_kwargs = dict(link="lumos5g", lumos_split="train", lumos_scale=args.lumos_scale, lumos_data=data, **frame)
+    env_kwargs = dict(link="lumos5g", lumos_split="train", lumos_scale=args.lumos_scale, lumos_data=data,
+                      episode_stall_floor=args.stall_floor_paired, **frame)
     eval_kwargs = dict(link="lumos5g", stall_allowance=allowance, lumos_scale=args.lumos_scale,
                        lumos_data=data, lumos_eval_windows=args.lumos_eval_windows, **frame)
     print(f"Lumos5G link: stall allowance {allowance}"
           f"{'' if args.stall_allowance is not None else ' (config default)'} -> training D_bar={d_bar:.4f} "
           f"(viewport-only floor {config.LUMOS5G_STALL_FLOOR_TRAIN} + allowance; evaluation: each episode's own "
           f"floor + allowance); B_bar={b_bar}{'' if args.b_bar is not None else ' (config default)'}; "
-          f"tile frame {args.tile_frame}; rate scale {args.lumos_scale}")
+          f"tile frame {args.tile_frame}; rate scale {args.lumos_scale}; obs_forced_bits={args.obs_forced_bits}; "
+          f"stall_floor_paired={args.stall_floor_paired}")
     return d_bar, b_bar, dropped_constraints, env_kwargs, eval_kwargs
 
 
@@ -465,6 +494,7 @@ def main():
         callbacks.append(LagrangianMultiplierCallback(
             d_bar=d_bar, p_bar=p_bar, b_bar=b_bar, eta=config.MU_LEARNING_RATE,
             dropped_constraints=dropped_constraints, log_dir=args.log_dir,
+            paired_floor=args.stall_floor_paired,
         ))
     callbacks.append(HeldOutTraceEvalCallback(
         d_bar=d_bar, p_bar=p_bar, b_bar=b_bar,
