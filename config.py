@@ -356,6 +356,19 @@ LUMOS5G_B_BAR = 11.0
 # Held-out evaluation: held-out viewers x this many fixed validation-run
 # windows (evenly spaced over the validation runs' 36-s windows).
 LUMOS5G_EVAL_WINDOWS = 12
+# Synthetic link "option 2" (--link synthetic; user decision 2026-10-13, from
+# the replay channel search in CHANNEL_VARIANTS/): the MMSP'25 channel above
+# (d 50 m, 50 mW, same path loss / rate formula) at 15 MHz, Rician K 2 dB,
+# slow shadowing 12 dB with memory 0.8 per second, blockages 29 dB deep for
+# 9% of the time, 6 s on average (streaming_rl/synthetic_link.py). Generated
+# as runs of SYNTH_RUN_SECONDS (train / validation / test counts below, run i
+# with seed SYNTH_SEED + i) and played back like the Lumos5G traces. Budgets:
+# the Lumos5G rule (unavoidable viewport-only stall + allowance; tile budget 11).
+SYNTH_LINK = dict(W_MHz=15.0, K_dB=2.0, sh_sigma=12.0, sh_rho=0.8, blk_att=29.0, blk_frac=0.09, blk_mean=6.0)
+SYNTH_RUNS = (300, 30, 30)
+SYNTH_RUN_SECONDS = 600
+SYNTH_SEED = 20261013
+SYNTH_STALL_FLOOR_TRAIN = 0.3934   # viewport-only J_D, exact over the training distribution (other/verify_synthetic_link.py)
 
 # PPO's own discount factor. Deliberately NOT reusing
 # DISCOUNT_FACTOR_LAMBDA=0.01 (the paper's CMDP/Bellman lambda, MMSP'25

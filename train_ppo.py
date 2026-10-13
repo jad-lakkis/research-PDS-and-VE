@@ -43,7 +43,7 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 import config
-from streaming_rl import data_loader, lumos5g
+from streaming_rl import data_loader, lumos5g, synthetic_link
 from streaming_rl.environment import TileStreamingEnv
 from streaming_rl.lagrangian import (
     LagrangianRewardWrapper, dual_ascent_step, mu_init_kwargs, parse_dropped_constraints,
@@ -85,7 +85,8 @@ class LagrangianMultiplierCallback(BaseCallback):
 
     def __init__(self, d_bar: float, p_bar: float, b_bar: float, eta: float,
                  dropped_constraints: frozenset = frozenset(), log_dir: str = None,
-                 feasibility_tol: float = 1e-9, paired_floor: bool = False, verbose: int = 0):
+                 feasibility_tol: float = 1e-9, paired_floor: bool = False, floor_train: float = None,
+                 verbose: int = 0):
         super().__init__(verbose)
         self.d_bar, self.p_bar, self.b_bar, self.eta = d_bar, p_bar, b_bar, eta
         # Lumos5G --stall-floor-paired: the stall multiplier compares each
@@ -95,6 +96,8 @@ class LagrangianMultiplierCallback(BaseCallback):
         # Same constraint in expectation; removes the window-to-window outage
         # noise (~9x smaller rollout-to-rollout swing).
         self.paired_floor = bool(paired_floor)
+        # the training-average floor of the trace link in use (Lumos5G or synthetic)
+        self.floor_train = config.LUMOS5G_STALL_FLOOR_TRAIN if floor_train is None else float(floor_train)
         self._J_D_floor_buffer: list = []
         # Dropped constraints' multipliers stay pinned at their 0.0 init
         # (set via mu_init_kwargs when the env was built) - dual ascent
@@ -147,7 +150,7 @@ class LagrangianMultiplierCallback(BaseCallback):
         J_D_for_update = avg_J_D
         if self.paired_floor:
             avg_floor = sum(self._J_D_floor_buffer) / n
-            J_D_for_update = avg_J_D - avg_floor + config.LUMOS5G_STALL_FLOOR_TRAIN
+            J_D_for_update = avg_J_D - avg_floor + self.floor_train
             self.logger.record("lagrangian/avg_J_D_floor", avg_floor)
             self.logger.record("lagrangian/avg_avoidable_stall", avg_J_D - avg_floor)
             self._J_D_floor_buffer.clear()
@@ -291,9 +294,11 @@ class TileEnhancementTrackerCallback(BaseCallback):
 def add_link_args(p) -> None:
     """Link-model flags, shared with train_ppo_pds.py. Default (rician) leaves
     every existing invocation unchanged."""
-    p.add_argument("--link", type=str, default="rician", choices=["rician", "lumos5g"],
+    p.add_argument("--link", type=str, default="rician", choices=["rician", "lumos5g", "synthetic"],
                    help="rician = synthetic channel + power action (original); lumos5g = measured "
-                        "Lumos5G throughput as R_t, fixed power, tile-only action")
+                        "Lumos5G throughput as R_t, fixed power, tile-only action; synthetic = the MMSP'25 "
+                        "channel with shadowing and blockages (config.SYNTH_LINK, streaming_rl/synthetic_link.py), "
+                        "played back as traces like Lumos5G (all lumos5g-only flags apply)")
     p.add_argument("--stall-allowance", type=float, default=None,
                    help="lumos5g only: stall budget = predicted-viewport-only J_D (unavoidable outage "
                         "stall) + this; training D_bar = config.LUMOS5G_STALL_FLOOR_TRAIN + this unless "
@@ -326,7 +331,7 @@ def link_setup(args, d_bar: float, b_bar: float, dropped_constraints: frozenset)
     frame = {} if args.tile_frame == "absolute" else {"tile_frame": args.tile_frame}
     if args.link == "rician":
         if args.obs_forced_bits or args.stall_floor_paired or args.obs_buffer != "linear":
-            raise ValueError("--obs-forced-bits / --stall-floor-paired / --obs-buffer need --link lumos5g")
+            raise ValueError("--obs-forced-bits / --stall-floor-paired / --obs-buffer need --link lumos5g or synthetic")
         return d_bar, b_bar, dropped_constraints, dict(frame), dict(frame)
     if args.obs_forced_bits:
         frame["obs_forced_bits"] = True
@@ -335,21 +340,27 @@ def link_setup(args, d_bar: float, b_bar: float, dropped_constraints: frozenset)
     allowance = args.stall_allowance if args.stall_allowance is not None else config.LUMOS5G_STALL_ALLOWANCE
     if args.b_bar is None:
         b_bar = config.LUMOS5G_B_BAR
+    if args.link == "synthetic":
+        if config.SYNTH_STALL_FLOOR_TRAIN is None:
+            raise ValueError("config.SYNTH_STALL_FLOOR_TRAIN is not set - run other/verify_synthetic_link.py")
+        floor, data, name = config.SYNTH_STALL_FLOOR_TRAIN, synthetic_link.load_bundle(), "Synthetic link (option 2)"
+    else:
+        floor, data, name = config.LUMOS5G_STALL_FLOOR_TRAIN, lumos5g.load_bundle(), "Lumos5G link"
+    args.stall_floor_train = floor   # read by LagrangianMultiplierCallback (paired stall estimate)
     if args.d_bar is None:
         if args.lumos_scale != 1.0:
-            raise ValueError("config.LUMOS5G_STALL_FLOOR_TRAIN is for raw rates - pass --d-bar with --lumos-scale")
-        d_bar = config.LUMOS5G_STALL_FLOOR_TRAIN + allowance
+            raise ValueError("the training stall floor is for unscaled rates - pass --d-bar with --lumos-scale")
+        d_bar = floor + allowance
     if "P" not in dropped_constraints:
         dropped_constraints = dropped_constraints | {"P"}
-        print("Lumos5G link: power is fixed, dropping the power constraint")
-    data = lumos5g.load_bundle()
+        print(f"{name}: power is fixed, dropping the power constraint")
     env_kwargs = dict(link="lumos5g", lumos_split="train", lumos_scale=args.lumos_scale, lumos_data=data,
                       episode_stall_floor=args.stall_floor_paired, **frame)
     eval_kwargs = dict(link="lumos5g", stall_allowance=allowance, lumos_scale=args.lumos_scale,
                        lumos_data=data, lumos_eval_windows=args.lumos_eval_windows, **frame)
-    print(f"Lumos5G link: stall allowance {allowance}"
+    print(f"{name}: stall allowance {allowance}"
           f"{'' if args.stall_allowance is not None else ' (config default)'} -> training D_bar={d_bar:.4f} "
-          f"(viewport-only floor {config.LUMOS5G_STALL_FLOOR_TRAIN} + allowance; evaluation: each episode's own "
+          f"(viewport-only floor {floor} + allowance; evaluation: each episode's own "
           f"floor + allowance); B_bar={b_bar}{'' if args.b_bar is not None else ' (config default)'}; "
           f"tile frame {args.tile_frame}; rate scale {args.lumos_scale}; obs_forced_bits={args.obs_forced_bits}; obs_buffer={args.obs_buffer}; "
           f"stall_floor_paired={args.stall_floor_paired}")
@@ -499,7 +510,7 @@ def main():
         callbacks.append(LagrangianMultiplierCallback(
             d_bar=d_bar, p_bar=p_bar, b_bar=b_bar, eta=config.MU_LEARNING_RATE,
             dropped_constraints=dropped_constraints, log_dir=args.log_dir,
-            paired_floor=args.stall_floor_paired,
+            paired_floor=args.stall_floor_paired, floor_train=getattr(args, "stall_floor_train", None),
         ))
     callbacks.append(HeldOutTraceEvalCallback(
         d_bar=d_bar, p_bar=p_bar, b_bar=b_bar,
